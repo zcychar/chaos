@@ -124,6 +124,7 @@ pub const SIGALRM: u32 = 14;
 
 pub const TIMER_WHEEL_SIZE: usize = 256;
 pub const TIMER_TICK_HZ: usize = 100;
+pub const BOOT_EPOCH: usize = 0;
 
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
@@ -1563,7 +1564,7 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
             if slots[i] { cur += 1; if cur > best { best = cur; } }
             else { cur = 0; }
         }
-        let mut order = 0;
+        let mut order: usize = 0;
         while (1 << order) <= best { order += 1; }
         order.saturating_sub(1)
     };
@@ -1782,7 +1783,7 @@ impl FHandle {
         let n = min(count, avail);
         let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
         drop(sd);
-        self.desc.write().unwrap().off += n;
+        self.desc.write().unwrap().off += n as u64;
         dst.write(&chunk)
     }
 }
@@ -1925,7 +1926,8 @@ impl FLike {
                 }
                 if d.buf.is_empty() {
                     d.bus.ev &= !EvFlag::READABLE;
-                    d.bus.cbs.retain(|f| !f(d.bus.ev));
+                    let ev = d.bus.ev;
+                    d.bus.cbs.retain(|f| !f(ev));
                 }
                 Ok(take)
             }
@@ -1968,7 +1970,10 @@ impl FLike {
                 if written > 0 {
                     let orig = d.bus.ev;
                     d.bus.ev |= EvFlag::READABLE;
-                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(d.bus.ev)); }
+                    if d.bus.ev != orig {
+                        let ev = d.bus.ev;
+                        d.bus.cbs.retain(|f| !f(ev));
+                    }
                 }
                 Ok(written)
             }
@@ -2980,8 +2985,8 @@ impl IoQueue {
             q.push_back(req);
             count += 1;
         }
-        let depth: i32 = q.len();
-        if depth > IOQUEUE_DEPTH as i32 {
+        let depth = q.len();
+        if depth > IOQUEUE_DEPTH {
             self.merge_adjacent();
         }
         count
@@ -3415,10 +3420,10 @@ impl SigSet {
 
     pub fn coalesce_pending(&mut self) -> u64 {
         let active = self.pending & !self.blocked;
-        let mut result: u32 = 0;
+        let mut result: u64 = 0;
         for i in 1..NSIG {
             if (active & (1u64 << i)) != 0 {
-                result |= 1 << i;
+                result |= 1u64 << i;
             }
         }
         result
@@ -3715,7 +3720,7 @@ impl Context {
             0..=3 => v & 0x0FFF_FFFF_FFFF_FFFF,
             4..=7 => (v << 4) >> 4,
             8..=11 => v.wrapping_neg(),
-            _ => self.r.get(idx),
+            _ => v,
         }
     }
 }
@@ -4250,7 +4255,10 @@ impl Task {
             let mut bus = self.ev.lock().unwrap();
             let orig = bus.ev;
             bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
-            if bus.ev != orig { bus.cbs.retain(|f| !f(bus.ev)); }
+            if bus.ev != orig {
+                let ev = bus.ev;
+                bus.cbs.retain(|f| !f(ev));
+            }
         }
         {
             let pg = self.parent.lock().unwrap();
@@ -4258,7 +4266,10 @@ impl Task {
                 let mut pbus = p.ev.lock().unwrap();
                 let orig = pbus.ev;
                 pbus.ev |= EvFlag::CHILD_QUIT;
-                if pbus.ev != orig { pbus.cbs.retain(|f| !f(pbus.ev)); }
+                if pbus.ev != orig {
+                    let ev = pbus.ev;
+                    pbus.cbs.retain(|f| !f(ev));
+                }
             }
         }
         let mut ec = self.exit_code.lock().unwrap();
@@ -4328,7 +4339,10 @@ impl Task {
         let mut bus = self.ev.lock().unwrap();
         let o = bus.ev;
         bus.ev |= EvFlag::RECV_SIG;
-        if bus.ev != o { bus.cbs.retain(|f| !f(bus.ev)); }
+        if bus.ev != o {
+            let ev = bus.ev;
+            bus.cbs.retain(|f| !f(ev));
+        }
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
@@ -4585,6 +4599,7 @@ pub fn yield_now_sync() { thread::yield_now(); }
 pub struct Kernel {
     pub tasks: TaskTable,
     pub cache: BlockCache,
+    pub disk: Disk,
     pub pool: FramePool,
     pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
     pub mnt: MountTable,
@@ -4597,6 +4612,7 @@ impl Kernel {
         Self {
             tasks: TaskTable::new(),
             cache: BlockCache::new(N_CHAINS),
+            disk: Disk::new("root"),
             pool: FramePool::new(nf),
             cpus: Mutex::new([None, None, None, None, None, None, None, None]),
             mnt: MountTable::new(),
@@ -4824,9 +4840,8 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::open("anon", opt);
-                    fh.cloexec = _cloexec;
-                    let fd = t.add_file(FLike::File(Arc::new(fh)));
+                    let fh = FHandle::new("anon", opt, false, _cloexec);
+                    let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
@@ -5142,11 +5157,9 @@ impl Kernel {
                             let my_pgid = *t.pgid.lock().unwrap();
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
-                            for tid in group {
-                                if let Some(child) = self.tasks.find(tid) {
-                                    if child.done() {
-                                        found = Some(tid);
-                                    }
+                            for child in group {
+                                if child.done() {
+                                    found = Some(child.id());
                                 }
                             }
                             match found {
@@ -5178,9 +5191,10 @@ impl Kernel {
                         let group = self.tasks.pgid_group(pgid);
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
-                        for &tid in &group {
-                            if let Some(t) = self.tasks.find(tid) {
-                                if t.done() { zombie_found = Some(tid); break; }
+                        for t in &group {
+                            if t.done() {
+                                zombie_found = Some(t.id());
+                                break;
                             }
                         }
                         match zombie_found {
@@ -5975,7 +5989,7 @@ impl AddrSpace {
         cow.values().filter(|f| f.count() > 1).count()
     }
 
-    pub fn split_region(&self, addr: usize) -> Result<(), &'static str> {
+    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
         let region = self.vm_map.find(addr).ok_or("enomem")?;
         let offset = addr - region.base;
         if offset == 0 || offset >= region.len { return Err("einval"); }
@@ -6046,7 +6060,7 @@ impl ProcessGroup {
             let task = tasks.find(pid);
             match task {
                 Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => { let _ = members.len(); }
+                None => {}
             }
         }
     }
@@ -6143,7 +6157,7 @@ impl WaitQueue {
 
     pub fn reorder_by_priority(&self) {
         let mut q = self.inner.lock().unwrap();
-        q.sort_by(|a, b| a.2.cmp(&b.2));
+        q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
     }
 }
 
@@ -6216,7 +6230,7 @@ impl ResourceLimits {
         if fds > self.max_fds { violations += 1; }
         if threads > self.max_threads { violations += 1; }
         if stack > self.max_stack_size { violations += 1; }
-        violations
+        violations > 0
     }
 }
 
@@ -6398,6 +6412,7 @@ impl BuddyAllocator {
             max_order: self.max_order,
             base_addr: self.base_addr,
             total_pages: self.total_pages,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
         }
     }
 }
