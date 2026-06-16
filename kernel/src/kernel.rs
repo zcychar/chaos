@@ -278,6 +278,19 @@ unsafe impl Send for KernLock {}
 unsafe impl Sync for KernLock {}
 pub static GKL: KernLock = KernLock::new();
 
+#[inline]
+pub fn gkl_scoped<R>(id: usize, f: impl FnOnce() -> R) -> R {
+    let already_locked = GKL.held();
+    if !already_locked {
+        GKL.enter(id);
+    }
+    let r = f();
+    if !already_locked {
+        GKL.leave();
+    }
+    r
+}
+
 pub struct ZoneInfo {
     pub zone_id: usize,
     pub base_pfn: usize,
@@ -1351,15 +1364,7 @@ impl FramePool {
         }
     }
     pub fn get(&self, id: usize) -> Option<usize> {
-        let already_locked = GKL.held();
-        if !already_locked {
-            GKL.enter(id);
-        }
-        let r = self.get_inner();
-        if !already_locked {
-            GKL.leave();
-        }
-        r
+        gkl_scoped(id, || self.get_inner())
     }
     pub fn get_inner(&self) -> Option<usize> {
         let mut s = self.slots.lock().unwrap();
@@ -3532,6 +3537,16 @@ impl CacheChain {
     }
 }
 
+#[inline]
+fn acquire_chain_lock(ch: &CacheChain) -> bool {
+    if GKL.held() {
+        ch.lk.try_acquire()
+    } else {
+        ch.lk.acquire();
+        true
+    }
+}
+
 pub struct BlockCache {
     pub chains: Vec<CacheChain>,
     pub width: usize,
@@ -3560,7 +3575,9 @@ impl BlockCache {
     pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
         let ci = self.chain_index(k)?;
         let ch = &self.chains[ci];
-        ch.lk.acquire();
+        if !acquire_chain_lock(ch) {
+            return None;
+        }
         let cached_data = {
             let e = ch.items.lock().unwrap();
             let mut found: Option<Vec<u8>> = None;
@@ -3592,7 +3609,9 @@ impl BlockCache {
             }
             payload
         };
-        ch.lk.acquire();
+        if !acquire_chain_lock(ch) {
+            return Some(block_data);
+        }
         let result = {
             let mut items = ch.items.lock().unwrap();
             if let Some(slot) = items.iter().find(|slot| slot.id == k) {
@@ -3615,9 +3634,7 @@ impl BlockCache {
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {
-        GKL.enter(id);
-        GKL.leave();
-
+        let _sync_ctx = id;
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
@@ -3642,13 +3659,8 @@ impl BlockCache {
             return;
         };
         let ch = &self.chains[ci];
-        while ch
-            .lk
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
+        if !acquire_chain_lock(ch) {
+            return;
         }
         {
             let mut items = ch.items.lock().unwrap();
@@ -3661,24 +3673,19 @@ impl BlockCache {
                 }
             }
         }
-        ch.lk.v.store(false, Ordering::Release);
+        ch.lk.release();
     }
 
     pub fn total_entries(&self) -> usize {
         let mut total = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
+            if !ch.lk.try_acquire() {
+                continue;
             }
             let n = ch.items.lock().unwrap().len();
             total += n;
-            ch.lk.v.store(false, Ordering::Release);
+            ch.lk.release();
         }
         total
     }
@@ -3687,13 +3694,8 @@ impl BlockCache {
         let mut count = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
+            if !ch.lk.try_acquire() {
+                continue;
             }
             let items = ch.items.lock().unwrap();
             for slot in items.iter() {
@@ -3702,7 +3704,7 @@ impl BlockCache {
                 }
             }
             drop(items);
-            ch.lk.v.store(false, Ordering::Release);
+            ch.lk.release();
         }
         count
     }
@@ -3712,13 +3714,8 @@ impl BlockCache {
         let mut evicted = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
+            if !ch.lk.try_acquire() {
+                continue;
             }
             {
                 let mut items = ch.items.lock().unwrap();
@@ -3729,7 +3726,7 @@ impl BlockCache {
                 });
                 evicted += before - items.len();
             }
-            ch.lk.v.store(false, Ordering::Release);
+            ch.lk.release();
         }
         evicted
     }
@@ -6053,8 +6050,7 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
-        GKL.enter(id);
-        let _ir = {
+        gkl_scoped(id, || {
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
             for (i, sl) in cg.iter().enumerate() {
@@ -6065,12 +6061,9 @@ impl Kernel {
             let busy = occ.count_ones() as usize;
             let total = MAX_CPU;
             if total > 0 {
-                ((total - busy) * 100) / total
-            } else {
-                100
+                let _ir = ((total - busy) * 100) / total;
             }
-        };
-        GKL.leave();
+        });
 
         {
             for ci in 0..self.cache.chains.len() {
@@ -6207,14 +6200,18 @@ impl Kernel {
                 let page_start = buf_addr & !(PAGE_SZ - 1);
                 let page_end = end_addr & !(PAGE_SZ - 1);
                 let page_span = (page_end - page_start) / PAGE_SZ;
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                let cached = {
-                    let items = ch.items.lock().unwrap();
-                    items.iter().any(|s| s.id == fd)
-                };
-                ch.lk.release();
+                let mut cached = false;
+                if self.cache.width > 0 {
+                    let ci = self.cache.idx(fd);
+                    let ch = &self.cache.chains[ci];
+                    if acquire_chain_lock(ch) {
+                        cached = {
+                            let items = ch.items.lock().unwrap();
+                            items.iter().any(|s| s.id == fd)
+                        };
+                        ch.lk.release();
+                    }
+                }
                 if cached {
                     let available = (page_span + 1) * PAGE_SZ;
                     let transfer = min(count, available);
@@ -6242,16 +6239,19 @@ impl Kernel {
                     return Err("efault");
                 }
                 let actual_len = count;
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                {
-                    let mut items = ch.items.lock().unwrap();
-                    if let Some(slot) = items.iter_mut().find(|s| s.id == fd) {
-                        slot.modified = true;
+                if self.cache.width > 0 {
+                    let ci = self.cache.idx(fd);
+                    let ch = &self.cache.chains[ci];
+                    if acquire_chain_lock(ch) {
+                        {
+                            let mut items = ch.items.lock().unwrap();
+                            if let Some(slot) = items.iter_mut().find(|s| s.id == fd) {
+                                slot.modified = true;
+                            }
+                        }
+                        ch.lk.release();
                     }
                 }
-                ch.lk.release();
                 if fd <= 2 {
                     let _drain = self.disk.ops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -6291,17 +6291,18 @@ impl Kernel {
                     }
                     best_prefix_len
                 };
-                if _create && _excl {
-                    let ci = path_addr % self.cache.width;
+                if _create && _excl && self.cache.width > 0 {
+                    let ci = self.cache.idx(path_addr);
                     let ch = &self.cache.chains[ci];
-                    ch.lk.acquire();
-                    let exists = {
-                        let items = ch.items.lock().unwrap();
-                        items.iter().any(|s| s.id == path_addr)
-                    };
-                    ch.lk.release();
-                    if exists {
-                        return Err("eexist");
+                    if acquire_chain_lock(ch) {
+                        let exists = {
+                            let items = ch.items.lock().unwrap();
+                            items.iter().any(|s| s.id == path_addr)
+                        };
+                        ch.lk.release();
+                        if exists {
+                            return Err("eexist");
+                        }
                     }
                 }
                 let cur = self.cur_task(0);
@@ -6341,16 +6342,20 @@ impl Kernel {
                 if fd > N_PROC * 4 {
                     return Err("ebadf");
                 }
-                let ci = fd % self.cache.width;
-                let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
-                let was_cached = {
-                    let mut items = ch.items.lock().unwrap();
-                    let before = items.len();
-                    items.retain(|s| s.id != fd);
-                    items.len() < before
-                };
-                ch.lk.release();
+                let mut was_cached = false;
+                if self.cache.width > 0 {
+                    let ci = self.cache.idx(fd);
+                    let ch = &self.cache.chains[ci];
+                    if acquire_chain_lock(ch) {
+                        was_cached = {
+                            let mut items = ch.items.lock().unwrap();
+                            let before = items.len();
+                            items.retain(|s| s.id != fd);
+                            items.len() < before
+                        };
+                        ch.lk.release();
+                    }
+                }
                 if was_cached {
                     self.disk.ops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -6870,14 +6875,18 @@ impl Kernel {
                         Ok(new_fd)
                     }
                     F_GETFD => {
-                        let ci = fd % self.cache.width;
-                        let ch = &self.cache.chains[ci];
-                        ch.lk.acquire();
-                        let cloexec = {
-                            let items = ch.items.lock().unwrap();
-                            items.iter().any(|s| s.id == fd && s.modified)
-                        };
-                        ch.lk.release();
+                        let mut cloexec = false;
+                        if self.cache.width > 0 {
+                            let ci = self.cache.idx(fd);
+                            let ch = &self.cache.chains[ci];
+                            if acquire_chain_lock(ch) {
+                                cloexec = {
+                                    let items = ch.items.lock().unwrap();
+                                    items.iter().any(|s| s.id == fd && s.modified)
+                                };
+                                ch.lk.release();
+                            }
+                        }
                         Ok(if cloexec { FD_CLOEXEC } else { 0 })
                     }
                     F_SETFD => {
