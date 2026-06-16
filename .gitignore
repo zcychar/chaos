@@ -33,3 +33,4 @@ test/
 
 export/
 docs/
+chaos-tests/tests/audit/

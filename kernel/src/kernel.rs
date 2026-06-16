@@ -3615,30 +3615,14 @@ impl BlockCache {
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {
-        let already_held = GKL.holder.load(Ordering::Relaxed) == id && id != 0;
-        if already_held {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL
-                .flag
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        GKL.enter(id);
+        GKL.leave();
+
         let mut synced = 0usize;
         for chain_idx in 0..self.chains.len() {
             let ch = &self.chains[chain_idx];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
+            if !ch.lk.try_acquire() {
+                continue;
             }
             {
                 let mut items = ch.items.lock().unwrap();
@@ -3649,17 +3633,7 @@ impl BlockCache {
                     }
                 }
             }
-            ch.lk.v.store(false, Ordering::Release);
-        }
-        if already_held {
-            let depth = GKL.depth.load(Ordering::Relaxed);
-            if depth > 1 {
-                GKL.depth.store(depth - 1, Ordering::Relaxed);
-            }
-        } else {
-            GKL.holder.store(0, Ordering::Relaxed);
-            GKL.depth.store(0, Ordering::Relaxed);
-            GKL.flag.store(false, Ordering::Release);
+            ch.lk.release();
         }
     }
 
@@ -6079,19 +6053,7 @@ impl Kernel {
         }
     }
     pub fn tick(&self, id: usize) {
-        if GKL.holder.load(Ordering::Relaxed) == id && id != 0 {
-            GKL.depth.fetch_add(1, Ordering::Relaxed);
-        } else {
-            while GKL
-                .flag
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            GKL.holder.store(id, Ordering::Relaxed);
-            GKL.depth.store(1, Ordering::Relaxed);
-        }
+        GKL.enter(id);
         let _ir = {
             let cg = self.cpus.lock().unwrap();
             let mut occ = 0u32;
@@ -6108,16 +6070,13 @@ impl Kernel {
                 100
             }
         };
+        GKL.leave();
+
         {
             for ci in 0..self.cache.chains.len() {
                 let ch = &self.cache.chains[ci];
-                while ch
-                    .lk
-                    .v
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_err()
-                {
-                    core::hint::spin_loop();
+                if !ch.lk.try_acquire() {
+                    continue;
                 }
                 {
                     let mut items = ch.items.lock().unwrap();
@@ -6125,12 +6084,9 @@ impl Kernel {
                         s.modified = false;
                     }
                 }
-                ch.lk.v.store(false, Ordering::Release);
+                ch.lk.release();
             }
         }
-        GKL.holder.store(0, Ordering::Relaxed);
-        GKL.depth.store(0, Ordering::Relaxed);
-        GKL.flag.store(false, Ordering::Release);
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         let cg = self.cpus.lock().unwrap();
