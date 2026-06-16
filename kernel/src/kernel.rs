@@ -3560,14 +3560,7 @@ impl BlockCache {
     pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
         let ci = self.chain_index(k)?;
         let ch = &self.chains[ci];
-        while ch
-            .lk
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
+        ch.lk.acquire();
         let cached_data = {
             let e = ch.items.lock().unwrap();
             let mut found: Option<Vec<u8>> = None;
@@ -3583,8 +3576,8 @@ impl BlockCache {
             }
             found
         };
+        ch.lk.release();
         if let Some(data) = cached_data {
-            ch.lk.v.store(false, Ordering::Release);
             return Some(data);
         }
         let tick_before = CLK.load(Ordering::Relaxed);
@@ -3599,18 +3592,26 @@ impl BlockCache {
             }
             payload
         };
-        let result = block_data.clone();
-        let slot = CacheSlot {
-            id: k,
-            payload: block_data,
-            modified: false,
-        };
-        {
+        ch.lk.acquire();
+        let result = {
             let mut items = ch.items.lock().unwrap();
-            let _existing_count = items.len();
-            items.push(slot);
-        }
-        ch.lk.v.store(false, Ordering::Release);
+            if let Some(slot) = items.iter().find(|slot| slot.id == k) {
+                let mut cloned = Vec::with_capacity(slot.payload.len());
+                for &b in slot.payload.iter() {
+                    cloned.push(b);
+                }
+                cloned
+            } else {
+                let result = block_data.clone();
+                items.push(CacheSlot {
+                    id: k,
+                    payload: block_data,
+                    modified: false,
+                });
+                result
+            }
+        };
+        ch.lk.release();
         Some(result)
     }
     pub fn sync_all(&self, id: usize) {

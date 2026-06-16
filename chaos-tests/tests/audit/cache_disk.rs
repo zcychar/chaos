@@ -1,4 +1,6 @@
 use chaos_tests::*;
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Duration;
 
 #[test]
@@ -56,6 +58,34 @@ fn audit_block_cache_sync_preserves_existing_gkl_owner() {
     }
 
     assert!(still_held);
+}
+
+#[test]
+fn audit_scheduler_tick_not_blocked_by_block_cache_miss_latency() {
+    let kernel = Arc::new(Kernel::new(64));
+    let slow_kernel = kernel.clone();
+
+    let slow_fetch = thread::spawn(move || {
+        assert!(slow_kernel
+            .cache
+            .fetch(17, Duration::from_millis(600))
+            .is_some());
+    });
+
+    thread::sleep(Duration::from_millis(25));
+
+    let tick_kernel = kernel.clone();
+    let (tx, rx) = mpsc::channel();
+    let tick = thread::spawn(move || {
+        tick_kernel.tick(77);
+        let _ = tx.send(());
+    });
+
+    let tick_result = rx.recv_timeout(Duration::from_millis(200)).ok();
+    slow_fetch.join().unwrap();
+    tick.join().unwrap();
+
+    assert_eq!(tick_result, Some(()));
 }
 
 #[test]
