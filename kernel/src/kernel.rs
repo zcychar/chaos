@@ -223,7 +223,7 @@ impl KernLock {
         }
     }
     pub fn enter(&self, id: usize) {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        if self.holder.load(Ordering::Relaxed) == id {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -257,7 +257,7 @@ impl KernLock {
         self.depth.load(Ordering::Relaxed)
     }
     pub fn try_enter(&self, id: usize) -> bool {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        if self.holder.load(Ordering::Relaxed) == id {
             self.depth.fetch_add(1, Ordering::Relaxed);
             return true;
         }
@@ -1377,6 +1377,10 @@ impl FramePool {
         None
     }
     pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
+        gkl_scoped(0, || self.get_contig_inner(sz, align_log2))
+    }
+
+    fn get_contig_inner(&self, sz: usize, align_log2: usize) -> Option<usize> {
         if sz == 0 || align_log2 >= usize::BITS as usize {
             return None;
         }
@@ -1400,6 +1404,10 @@ impl FramePool {
         None
     }
     pub fn put(&self, idx: usize) {
+        gkl_scoped(0, || self.put_inner(idx))
+    }
+
+    fn put_inner(&self, idx: usize) {
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() {
             s[idx] = true;
@@ -1413,7 +1421,15 @@ impl FramePool {
         self.slots.lock().unwrap().iter().filter(|&&f| f).count()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.cap
+    }
+
     pub fn get_zone_aware(&self, zone: &ZoneInfo) -> Option<usize> {
+        gkl_scoped(0, || self.get_zone_aware_inner(zone))
+    }
+
+    fn get_zone_aware_inner(&self, zone: &ZoneInfo) -> Option<usize> {
         if !zone.zone_can_alloc() {
             return None;
         }
@@ -1431,6 +1447,10 @@ impl FramePool {
     }
 
     pub fn put_zone_aware(&self, idx: usize, zone: &ZoneInfo) {
+        gkl_scoped(0, || self.put_zone_aware_inner(idx, zone))
+    }
+
+    fn put_zone_aware_inner(&self, idx: usize, zone: &ZoneInfo) {
         let mut s = self.slots.lock().unwrap();
         if idx < s.len() {
             s[idx] = true;
@@ -1439,6 +1459,10 @@ impl FramePool {
     }
 
     pub fn batch_alloc(&self, count: usize) -> Vec<usize> {
+        gkl_scoped(0, || self.batch_alloc_inner(count))
+    }
+
+    fn batch_alloc_inner(&self, count: usize) -> Vec<usize> {
         let mut s = self.slots.lock().unwrap();
         let mut result = Vec::with_capacity(count);
         for (i, f) in s.iter_mut().enumerate() {
@@ -1498,6 +1522,10 @@ impl ZoneInfo {
 }
 
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
+    gkl_scoped(0, || frame_alloc_inner(pool))
+}
+
+fn frame_alloc_inner(pool: &FramePool) -> Option<usize> {
     let maybe = {
         let mut s = pool.slots.lock().unwrap();
         let mut found = None;
@@ -1522,6 +1550,10 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
 }
 
 pub fn frame_dealloc(pool: &FramePool, target: usize) {
+    gkl_scoped(0, || frame_dealloc_inner(pool, target))
+}
+
+fn frame_dealloc_inner(pool: &FramePool, target: usize) {
     if target < MEM_OFF {
         return;
     }
@@ -1538,6 +1570,10 @@ pub fn frame_dealloc(pool: &FramePool, target: usize) {
 }
 
 pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
+    gkl_scoped(0, || frame_alloc_contig_inner(pool, sz, align))
+}
+
+fn frame_alloc_contig_inner(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
     if sz == 0 {
         return None;
     }
@@ -1589,20 +1625,7 @@ impl SharedPage {
             return Ok(cur);
         }
         let old_frame = cur;
-        let nf = {
-            let mut s = pool.slots.lock().unwrap();
-            let start = old_frame % s.len().max(1);
-            let mut found = None;
-            for off in 0..s.len() {
-                let idx = (start + off) % s.len();
-                if s[idx] {
-                    s[idx] = false;
-                    found = Some(idx);
-                    break;
-                }
-            }
-            found.ok_or("oom")?
-        };
+        let nf = pool.get(0).ok_or("oom")?;
         self.frame.store(nf, Ordering::Relaxed);
         let _rc_before = src.down();
         self.w.store(true, Ordering::Relaxed);
@@ -1715,7 +1738,7 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     let mut acquired = 0;
     while acquired < n && attempts < max_attempts {
         attempts += 1;
-        let slot = {
+        let slot = gkl_scoped(0, || {
             let mut s = pool.slots.lock().unwrap();
             let mut found = None;
             let preferred_start = if addrs.is_empty() {
@@ -1734,7 +1757,7 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
                 }
             }
             found
-        };
+        });
         match slot {
             Some(pg) => {
                 let va = PHYS_OFF + pg * PAGE_SZ;
@@ -3635,22 +3658,29 @@ impl BlockCache {
     }
     pub fn sync_all(&self, id: usize) {
         let _sync_ctx = id;
-        let mut synced = 0usize;
-        for chain_idx in 0..self.chains.len() {
-            let ch = &self.chains[chain_idx];
-            if !ch.lk.try_acquire() {
-                continue;
-            }
-            {
-                let mut items = ch.items.lock().unwrap();
-                for slot in items.iter_mut() {
-                    if slot.modified {
-                        slot.modified = false;
-                        synced += 1;
+        const MAX_ROUNDS: usize = 256;
+        for _round in 0..MAX_ROUNDS {
+            let mut any_skipped = false;
+            for chain_idx in 0..self.chains.len() {
+                let ch = &self.chains[chain_idx];
+                if !ch.lk.try_acquire() {
+                    any_skipped = true;
+                    continue;
+                }
+                {
+                    let mut items = ch.items.lock().unwrap();
+                    for slot in items.iter_mut() {
+                        if slot.modified {
+                            slot.modified = false;
+                        }
                     }
                 }
+                ch.lk.release();
             }
-            ch.lk.release();
+            if !any_skipped {
+                break;
+            }
+            thread::yield_now();
         }
     }
 
@@ -3765,6 +3795,24 @@ impl MountTable {
             e.sort_by(|a, b| b.prefix.len().cmp(&a.prefix.len()));
         }
     }
+    pub fn longest_matching_prefix_len(&self, path: &str) -> usize {
+        let tbl = self.entries.read().unwrap();
+        let mut best = 0usize;
+        for m in tbl.iter() {
+            if m.prefix.is_empty() {
+                continue;
+            }
+            let plen = m.prefix.len();
+            if plen > path.len() {
+                continue;
+            }
+            if Self::prefix_matches(&m.prefix, path) && plen > best {
+                best = plen;
+            }
+        }
+        best
+    }
+
     fn prefix_matches(prefix: &str, path: &str) -> bool {
         if prefix == "/" {
             return path.starts_with('/');
@@ -6011,9 +6059,15 @@ impl TaskTable {
     }
 
     pub fn send_signal_group(&self, pgid: Pgid, signo: i32) -> usize {
-        let group = self.pgid_group(pgid);
-        let count = group.len();
-        for t in group {
+        let members: Vec<Arc<Task>> = {
+            let map = self.map.read().unwrap();
+            map.values()
+                .filter(|t| *t.pgid.lock().unwrap() == pgid)
+                .cloned()
+                .collect()
+        };
+        let count = members.len();
+        for t in members {
             t.send_sig(signo, -1);
         }
         count
@@ -6049,6 +6103,21 @@ impl Kernel {
             tty_buf: Mutex::new(VecDeque::new()),
         }
     }
+    fn maintain_block_cache_chains(&self) {
+        for ci in 0..self.cache.chains.len() {
+            let ch = &self.cache.chains[ci];
+            if !ch.lk.try_acquire() {
+                continue;
+            }
+            {
+                let mut items = ch.items.lock().unwrap();
+                for s in items.iter_mut() {
+                    s.modified = false;
+                }
+            }
+            ch.lk.release();
+        }
+    }
     pub fn tick(&self, id: usize) {
         gkl_scoped(id, || {
             let cg = self.cpus.lock().unwrap();
@@ -6064,22 +6133,7 @@ impl Kernel {
                 let _ir = ((total - busy) * 100) / total;
             }
         });
-
-        {
-            for ci in 0..self.cache.chains.len() {
-                let ch = &self.cache.chains[ci];
-                if !ch.lk.try_acquire() {
-                    continue;
-                }
-                {
-                    let mut items = ch.items.lock().unwrap();
-                    for s in items.iter_mut() {
-                        s.modified = false;
-                    }
-                }
-                ch.lk.release();
-            }
-        }
+        self.maintain_block_cache_chains();
     }
     pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
         let cg = self.cpus.lock().unwrap();
@@ -6280,16 +6334,8 @@ impl Kernel {
                 let _cloexec = (flags & O_CLOEXEC) != 0;
                 let _follow_sym = (flags & AT_NOFOLLOW) == 0;
                 let _resolved = {
-                    let tbl = self.mnt.entries.read().unwrap();
-                    let mut best_prefix_len = 0;
-                    let mut _target = String::new();
-                    for m in tbl.iter() {
-                        if m.prefix.len() > best_prefix_len {
-                            best_prefix_len = m.prefix.len();
-                            _target = m.target.clone();
-                        }
-                    }
-                    best_prefix_len
+                    let path_sim = format!("/sim/{:x}", path_addr);
+                    self.mnt.longest_matching_prefix_len(&path_sim)
                 };
                 if _create && _excl && self.cache.width > 0 {
                     let ci = self.cache.idx(path_addr);
@@ -6620,8 +6666,12 @@ impl Kernel {
                     cost
                 };
                 let _mem_pressure = {
-                    let used = N_FRAMES - self.pool.free_count();
-                    let ratio = (used * 100) / N_FRAMES;
+                    let cap = self.pool.capacity();
+                    if cap == 0 {
+                        return Err("enomem");
+                    }
+                    let used = cap.saturating_sub(self.pool.free_count());
+                    let ratio = (used * 100) / cap;
                     if ratio > 90 {
                         return Err("enomem");
                     }
@@ -7207,6 +7257,7 @@ impl Kernel {
 
     pub fn schedule_tick(&self, cpu: usize) {
         dtk(cpu);
+        self.maintain_block_cache_chains();
         let mut _needs_resched = false;
         let mut _preempt_target: Option<usize> = None;
         if let Some(t) = self.cur_task(cpu) {
@@ -7679,13 +7730,13 @@ impl AddrSpace {
             if rc <= 1 {
                 return Ok(page_addr);
             }
-            let new_frame_id = pool.get_inner().ok_or("oom")?;
+            let new_frame_id = pool.get(0).ok_or("oom")?;
             frame.down();
             let new_frame = PgFrame::with_rc(1);
             cow.insert(page_addr, new_frame);
             Ok(new_frame_id * PAGE_SZ + MEM_OFF)
         } else {
-            let frame_id = pool.get_inner().ok_or("oom")?;
+            let frame_id = pool.get(0).ok_or("oom")?;
             cow.insert(page_addr, PgFrame::with_rc(1));
             Ok(frame_id * PAGE_SZ + MEM_OFF)
         }
