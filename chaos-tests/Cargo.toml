@@ -13,6 +13,62 @@ name = "basic"
 path = "tests/basic/main.rs"
 
 [[test]]
+name = "audit_sync"
+path = "tests/audit/sync.rs"
+
+[[test]]
+name = "audit_memory"
+path = "tests/audit/memory.rs"
+
+[[test]]
+name = "audit_helpers"
+path = "tests/audit/helpers.rs"
+
+[[test]]
+name = "audit_fileio"
+path = "tests/audit/fileio.rs"
+
+[[test]]
+name = "audit_channel"
+path = "tests/audit/channel.rs"
+
+[[test]]
+name = "audit_cache_disk"
+path = "tests/audit/cache_disk.rs"
+
+[[test]]
+name = "audit_ipc"
+path = "tests/audit/ipc.rs"
+
+[[test]]
+name = "audit_signal_timer"
+path = "tests/audit/signal_timer.rs"
+
+[[test]]
+name = "audit_context_trap"
+path = "tests/audit/context_trap.rs"
+
+[[test]]
+name = "audit_scheduler"
+path = "tests/audit/scheduler.rs"
+
+[[test]]
+name = "audit_syscalls"
+path = "tests/audit/syscalls.rs"
+
+[[test]]
+name = "audit_utils"
+path = "tests/audit/utils.rs"
+
+[[test]]
+name = "audit_resources"
+path = "tests/audit/resources.rs"
+
+[[test]]
+name = "audit_buddy"
+path = "tests/audit/buddy.rs"
+
+[[test]]
 name = "advanced"
 path = "tests/advanced/main.rs"
 

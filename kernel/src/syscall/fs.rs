@@ -21,7 +21,7 @@ use core::task::{Context, Poll};
 use bitvec::prelude::{BitSlice, BitVec, Lsb0};
 
 use super::*;
-use crate::fs::epoll::EpollInstance;
+use crate::fs::epoll::{EPollCtlOp, EpollInstance};
 use crate::fs::fcntl::{FD_CLOEXEC, F_SETFD, O_CLOEXEC, O_NONBLOCK};
 use crate::fs::FileLike;
 use crate::process::Process;
@@ -311,7 +311,10 @@ impl Syscall<'_> {
         info!("epoll_create1: flags: {:?}", flags);
         let mut proc = self.process();
         let epoll_instance = EpollInstance::new(flags);
-        let fd = proc.add_file(FileLike::EpollInstance(epoll_instance));
+        let fd = proc.add_file_with_cloexec(
+            FileLike::EpollInstance(epoll_instance),
+            (flags & O_CLOEXEC) != 0,
+        );
         Ok(fd)
     }
 
@@ -328,7 +331,13 @@ impl Syscall<'_> {
             info!("sys_epoll_ctl: epfd: {}, op: {:?}, fd: {:#x}", epfd, op, fd);
         }
 
-        let _event = unsafe { self.vm().check_read_ptr(event)? };
+        let event = match op as i32 {
+            EPollCtlOp::ADD | EPollCtlOp::MOD => {
+                Some(unsafe { self.vm().check_read_ptr(event)? }.clone())
+            }
+            EPollCtlOp::DEL => None,
+            _ => return Err(SysError::EINVAL),
+        };
 
         if proc.files.get(&fd).is_none() {
             return Err(SysError::EPERM);
@@ -341,7 +350,7 @@ impl Syscall<'_> {
             }
         };
 
-        let ret = epoll_instance.control(op, fd, &_event)?;
+        let ret = epoll_instance.control(op, fd, event.as_ref())?;
         return Ok(ret);
     }
 
@@ -365,22 +374,32 @@ impl Syscall<'_> {
     ) -> SysResult {
         info!("epoll_pwait: epfd: {}, timeout: {:?}", epfd, timeout_msecs);
 
+        if maxevents == 0 {
+            return Err(SysError::EINVAL);
+        }
+
         let proc = self.process();
         let events = unsafe { self.vm().check_write_array(events, maxevents)? };
         let epoll_instance = proc.get_epoll_instance(epfd)?;
 
         // add new fds which are registered by epoll_ctl after latest epoll_pwait
-        epoll_instance.ready_list.lock().clear();
-        epoll_instance
-            .ready_list
-            .lock()
-            .extend(epoll_instance.new_ctl_list.lock().clone());
+        let new_ctl_list = epoll_instance.new_ctl_list.lock().clone();
+        let mut ready_list = epoll_instance.ready_list.lock();
+        ready_list.clear();
+        ready_list.extend(new_ctl_list);
+        drop(ready_list);
         epoll_instance.new_ctl_list.lock().clear();
 
         // if registered fd has data to handle and its mode isn't epollet, we need
         // to add it to the list.
-        let keys: Vec<_> = epoll_instance.events.keys().cloned().collect();
-        for (k, v) in epoll_instance.events.iter() {
+        let event_entries: Vec<_> = epoll_instance
+            .events
+            .lock()
+            .iter()
+            .map(|(fd, event)| (*fd, event.clone()))
+            .collect();
+        let keys: Vec<_> = event_entries.iter().map(|(fd, _)| *fd).collect();
+        for (k, v) in event_entries.iter() {
             if !v.contains(EpollEvent::EPOLLET) {
                 match &proc.files.get(k) {
                     None => {
@@ -469,24 +488,39 @@ impl Syscall<'_> {
                             return Some(Err(err));
                         }
                     };
-                    let epollevent = epoll_instance.events.get_mut(&infd)?;
+                    let epollevent = {
+                        let epoll_events = epoll_instance.events.lock();
+                        match epoll_events.get(infd) {
+                            Some(event) => event.clone(),
+                            None => continue,
+                        }
+                    };
 
-                    if status.error {
+                    if status.error && events_num < maxevents {
                         events[events_num].events = EpollEvent::EPOLLERR;
                         events[events_num].data = epollevent.data;
 
                         events_num += 1;
                     }
-                    if status.read && epollevent.contains(EpollEvent::EPOLLIN) {
+                    if status.read
+                        && epollevent.contains(EpollEvent::EPOLLIN)
+                        && events_num < maxevents
+                    {
                         events[events_num].events = EpollEvent::EPOLLIN;
                         events[events_num].data = epollevent.data;
                         events_num += 1;
                     }
-                    if status.write && epollevent.contains(EpollEvent::EPOLLOUT) {
+                    if status.write
+                        && epollevent.contains(EpollEvent::EPOLLOUT)
+                        && events_num < maxevents
+                    {
                         events[events_num].events = EpollEvent::EPOLLOUT;
                         events[events_num].data = epollevent.data;
 
                         events_num += 1;
+                    }
+                    if events_num >= maxevents {
+                        break;
                     }
                 }
             }
@@ -632,7 +666,8 @@ impl Syscall<'_> {
             debug!("files before open {:#?}", proc.files);
         }
 
-        let fd = proc.add_file(FileLike::File(file));
+        let fd =
+            proc.add_file_with_cloexec(FileLike::File(file), flags.contains(OpenFlags::CLOEXEC));
         Ok(fd)
     }
 
@@ -645,7 +680,7 @@ impl Syscall<'_> {
             debug!("files before close {:#?}", proc.files);
         }
 
-        proc.files.remove(&fd).ok_or(SysError::EBADF)?;
+        proc.close_file(fd).ok_or(SysError::EBADF)?;
         Ok(0)
     }
 
@@ -763,7 +798,8 @@ impl Syscall<'_> {
 
     pub fn sys_lseek(&mut self, fd: usize, offset: i64, whence: u8) -> SysResult {
         let pos = match whence {
-            SEEK_SET => SeekFrom::Start(offset as u64),
+            SEEK_SET if offset >= 0 => SeekFrom::Start(offset as u64),
+            SEEK_SET => return Err(SysError::EINVAL),
             SEEK_END => SeekFrom::End(offset),
             SEEK_CUR => SeekFrom::Current(offset),
             _ => return Err(SysError::EINVAL),
@@ -776,6 +812,9 @@ impl Syscall<'_> {
             Err(ESPIPE)
         } else {
             let offset = file.seek(pos)?;
+            if offset > usize::MAX as u64 {
+                return Err(SysError::EINVAL);
+            }
             Ok(offset as usize)
         }
     }
@@ -866,16 +905,25 @@ impl Syscall<'_> {
 
     fn dup_impl(&mut self, fd1: usize, fd2: usize, flags: usize) -> SysResult {
         let mut proc = self.process();
-        // close fd2 first if it is opened
-        proc.files.remove(&fd2);
+        let fd_cloexec = (flags & O_CLOEXEC) != 0;
 
-        let mut file_like = proc.get_file_like(fd1)?.dup(flags != 0);
+        if fd1 == fd2 {
+            proc.files.get(&fd1).ok_or(SysError::EBADF)?;
+            return Ok(fd2);
+        }
+
+        let file_like = proc.get_file_like(fd1)?.dup(fd_cloexec);
+        proc.close_file(fd2);
         proc.files.insert(fd2, file_like);
+        proc.set_fd_cloexec(fd2, fd_cloexec);
         Ok(fd2)
     }
 
     pub fn sys_dup3(&mut self, fd1: usize, fd2: usize, flags: usize) -> SysResult {
         info!("dup3: from {} to {} with flags = {:#x}", fd1, fd2, flags);
+        if fd1 == fd2 || (flags & !O_CLOEXEC) != 0 {
+            return Err(SysError::EINVAL);
+        }
         self.dup_impl(fd1, fd2, flags)
     }
 
@@ -1119,31 +1167,38 @@ impl Syscall<'_> {
         let fds = unsafe { self.vm().check_write_array(fds, 2)? };
         let (read, write) = Pipe::create_pair();
 
-        let read_fd = proc.add_file(FileLike::File(FileHandle::new(
-            Arc::new(read),
-            OpenOptions {
-                read: true,
-                write: false,
-                append: false,
-                nonblock: (flags & O_NONBLOCK) != 0,
-            },
-            String::from("pipe_r:[]"),
-            true,
-            (flags & O_CLOEXEC) != 0,
-        )));
+        let fd_cloexec = (flags & O_CLOEXEC) != 0;
+        let read_fd = proc.add_file_with_cloexec(
+            FileLike::File(FileHandle::new(
+                Arc::new(read),
+                OpenOptions {
+                    read: true,
+                    write: false,
+                    append: false,
+                    nonblock: (flags & O_NONBLOCK) != 0,
+                },
+                String::from("pipe_r:[]"),
+                true,
+                fd_cloexec,
+            )),
+            fd_cloexec,
+        );
 
-        let write_fd = proc.add_file(FileLike::File(FileHandle::new(
-            Arc::new(write),
-            OpenOptions {
-                read: false,
-                write: true,
-                append: false,
-                nonblock: false,
-            },
-            String::from("pipe_w:[]"),
-            true,
-            (flags & O_CLOEXEC) != 0,
-        )));
+        let write_fd = proc.add_file_with_cloexec(
+            FileLike::File(FileHandle::new(
+                Arc::new(write),
+                OpenOptions {
+                    read: false,
+                    write: true,
+                    append: false,
+                    nonblock: false,
+                },
+                String::from("pipe_w:[]"),
+                true,
+                fd_cloexec,
+            )),
+            fd_cloexec,
+        );
 
         fds[0] = read_fd as u32;
         fds[1] = write_fd as u32;
@@ -1317,36 +1372,40 @@ impl Syscall<'_> {
     pub fn sys_fcntl(&mut self, fd: usize, cmd: usize, arg: usize) -> SysResult {
         info!("fcntl: fd: {}, cmd: {:#x}, arg: {}", fd, cmd, arg);
         let mut proc = self.process();
-        let file_like = proc.get_file_like(fd)?;
-        match file_like {
-            FileLike::File(file) => {
-                use crate::fs::fcntl::*;
-                match cmd {
-                    F_SETFD => {
-                        file.fd_cloexec = (arg & 1) != 0;
-                        Ok(0)
-                    }
-                    F_GETFD => Ok(file.fd_cloexec as usize),
-                    F_SETFL => {
-                        file.set_options(arg);
-                        Ok(0)
-                    }
-                    F_GETFL => self.unimplemented("F_GETFL", Ok(0)),
-                    F_DUPFD_CLOEXEC => {
-                        info!("fcntl: dupfd_cloexec: arg: {:#x}", arg);
-                        // let file_like = proc.get_file_like(fd1)?.clone();
-                        let new_fd = proc.get_free_fd_from(arg);
-                        core::mem::drop(proc);
-                        self.dup_impl(fd, new_fd, 1)
-                    }
-                    _ => Ok(0),
-                }
-            }
-            FileLike::Socket(_) => {
+        if !proc.files.contains_key(&fd) {
+            return Err(SysError::EBADF);
+        }
+        use crate::fs::fcntl::*;
+        match cmd {
+            F_SETFD => {
+                proc.set_fd_cloexec(fd, (arg & FD_CLOEXEC) != 0);
                 Ok(0)
-                //TODO
             }
-            FileLike::EpollInstance(_) => Ok(0),
+            F_GETFD => Ok(if proc.is_fd_cloexec(fd) {
+                FD_CLOEXEC
+            } else {
+                0
+            }),
+            F_SETFL => {
+                if let FileLike::File(file) = proc.get_file_like(fd)? {
+                    file.set_options(arg);
+                }
+                Ok(0)
+            }
+            F_GETFL => self.unimplemented("F_GETFL", Ok(0)),
+            F_DUPFD => {
+                info!("fcntl: dupfd: arg: {:#x}", arg);
+                let new_fd = proc.get_free_fd_from(arg);
+                core::mem::drop(proc);
+                self.dup_impl(fd, new_fd, 0)
+            }
+            F_DUPFD_CLOEXEC => {
+                info!("fcntl: dupfd_cloexec: arg: {:#x}", arg);
+                let new_fd = proc.get_free_fd_from(arg);
+                core::mem::drop(proc);
+                self.dup_impl(fd, new_fd, O_CLOEXEC)
+            }
+            _ => Ok(0),
         }
     }
 }

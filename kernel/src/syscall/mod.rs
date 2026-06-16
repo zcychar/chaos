@@ -238,7 +238,7 @@ impl Syscall<'_> {
             SYS_UMOUNT2 => self.unimplemented("umount2", Err(SysError::EACCES)),
 
             // memory
-            SYS_BRK => self.unimplemented("brk", Err(SysError::ENOMEM)),
+            SYS_BRK => self.sys_brk(args[0]),
             SYS_MMAP => self.sys_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
             SYS_MPROTECT => self.sys_mprotect(args[0], args[1], args[2]),
             SYS_MUNMAP => self.sys_munmap(args[0], args[1]),

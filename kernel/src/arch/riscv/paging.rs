@@ -44,6 +44,7 @@ impl PageTable for PageTableImpl {
             .map_to(page, frame, flags, &mut FrameAllocatorForRiscv)
             .unwrap()
             .flush();
+        self.normalize_intermediate_entries(page);
         self.get_entry(addr).expect("fail to get entry")
     }
 
@@ -80,7 +81,8 @@ impl PageTable for PageTableImpl {
 impl Entry for PageEntry {
     fn update(&mut self) {
         unsafe {
-            sfence_vma(0, self.1.start_address().as_usize());
+            // This riscv crate wrapper forwards its first argument to sfence.vma rs1 (vaddr).
+            sfence_vma(self.1.start_address().as_usize(), 0);
         }
     }
     fn accessed(&self) -> bool {
@@ -154,6 +156,44 @@ impl Entry for PageEntry {
 }
 
 impl PageTableImpl {
+    fn normalize_non_leaf_entry(entry: &mut PageTableEntry) {
+        let leaf_bits = EF::READABLE | EF::WRITABLE | EF::EXECUTABLE;
+        if entry.flags().contains(EF::VALID) && !entry.flags().intersects(leaf_bits) {
+            entry
+                .flags_mut()
+                .remove(EF::ACCESSED | EF::DIRTY | EF::USER);
+        }
+    }
+
+    #[cfg(target_arch = "riscv32")]
+    fn normalize_intermediate_entries(&mut self, page: Page) {
+        let table = unsafe {
+            &mut *(phys_to_virt(self.root_frame.start_address().as_usize()) as *mut RvPageTable)
+        };
+        Self::normalize_non_leaf_entry(&mut table[page.p2_index()]);
+        unsafe {
+            sfence_vma(page.start_address().as_usize(), 0);
+        }
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    fn normalize_intermediate_entries(&mut self, page: Page) {
+        let table = unsafe {
+            &mut *(phys_to_virt(self.root_frame.start_address().as_usize()) as *mut RvPageTable)
+        };
+        let p2_frame = {
+            let entry = &mut table[page.p3_index()];
+            Self::normalize_non_leaf_entry(entry);
+            entry.frame::<PhysAddr>()
+        };
+        let p2_table: &mut RvPageTable =
+            unsafe { p2_frame.as_kernel_mut(PHYSICAL_MEMORY_OFFSET as u64) };
+        Self::normalize_non_leaf_entry(&mut p2_table[page.p2_index()]);
+        unsafe {
+            sfence_vma(page.start_address().as_usize(), 0);
+        }
+    }
+
     /// Unsafely get the current active page table.
     /// Using ManuallyDrop to wrap the page table: this is how `core::mem::forget` is implemented now.
     pub unsafe fn active() -> ManuallyDrop<Self> {

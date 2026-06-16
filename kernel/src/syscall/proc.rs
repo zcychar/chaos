@@ -2,7 +2,6 @@
 
 use super::*;
 use crate::arch::timer::timer_now;
-use crate::fs::FileLike;
 use crate::signal::{send_signal, Signal};
 use crate::{
     sync::{wait_for_event, Event, EventBus, SpinNoIrqLock as Mutex},
@@ -92,47 +91,58 @@ impl Syscall<'_> {
         #[derive(Debug)]
         enum WaitFor {
             AnyChild,
-            AnyChildInGroup,
+            ProcessGroup(Pgid),
             Pid(usize),
         }
         let target = match pid {
             -1 => WaitFor::AnyChild,
-            0 => WaitFor::AnyChildInGroup,
+            0 => WaitFor::ProcessGroup(self.process().pgid),
             p if p > 0 => WaitFor::Pid(p as usize),
-            _ => unimplemented!(),
+            p => {
+                let pgid = p
+                    .checked_neg()
+                    .filter(|pgid| *pgid <= i32::MAX as isize)
+                    .ok_or(SysError::EINVAL)?;
+                WaitFor::ProcessGroup(pgid as Pgid)
+            }
         };
         loop {
             info!("wait4 loop: pid: {}, code: {:?}", pid, wstatus);
-            let mut proc = self.process();
-
-            // check child state
-            let find = match target {
-                WaitFor::AnyChild | WaitFor::AnyChildInGroup => {
-                    let mut res = None;
-                    for (pid, child) in &proc.children {
-                        if let Some(c) = child.upgrade() {
-                            let p = c.lock();
-                            if p.exited() {
-                                res = Some((p.pid, p.exit_code));
-                                break;
-                            }
-                        } else {
-                            info!("wait: pid {} is missing", pid);
-                        }
+            let (children, eventbus) = {
+                let mut proc = self.process();
+                proc.children.retain(|(pid, weak)| {
+                    let alive = weak.upgrade().is_some();
+                    if !alive {
+                        info!("wait: pid {} is missing", pid);
                     }
-                    res
-                }
-                WaitFor::Pid(pid) => {
-                    let mut res = None;
-                    if let Some(c) = process(pid) {
-                        let p = c.lock();
-                        if p.exited() {
-                            res = Some((p.pid, p.exit_code));
-                        }
-                    }
-                    res
-                }
+                    alive
+                });
+                let children = proc
+                    .children
+                    .iter()
+                    .filter_map(|(_, weak)| weak.upgrade())
+                    .collect::<Vec<_>>();
+                (children, proc.eventbus.clone())
             };
+
+            let mut matched_child = false;
+            let mut find = None;
+            for child in children {
+                let child_proc = child.lock();
+                let matched = match target {
+                    WaitFor::AnyChild => true,
+                    WaitFor::ProcessGroup(pgid) => child_proc.pgid == pgid,
+                    WaitFor::Pid(pid) => child_proc.pid.get() == pid,
+                };
+                if matched {
+                    matched_child = true;
+                    if child_proc.exited() {
+                        find = Some((child_proc.pid, child_proc.exit_code));
+                        break;
+                    }
+                }
+            }
+
             // if found, return
             if let Some((pid, exit_code)) = find {
                 info!("wait: found pid {}", pid);
@@ -149,37 +159,18 @@ impl Syscall<'_> {
                 }
 
                 // remove from children
+                let mut proc = self.process();
                 proc.children.retain(|(p, _)| *p != pid);
 
                 return Ok(pid.get());
             }
             // if not, check pid
-            let invalid = {
-                let children = proc
-                    .children
-                    .iter()
-                    .filter_map(|(pid, weak)| {
-                        if weak.upgrade().is_none() {
-                            None
-                        } else {
-                            Some(pid)
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                match target {
-                    WaitFor::AnyChild | WaitFor::AnyChildInGroup => children.len() == 0,
-                    WaitFor::Pid(pid) => children.iter().find(|p| p.get() == pid).is_none(),
-                }
-            };
-            if invalid {
+            if !matched_child {
                 info!("wait: no valid child proc");
                 return Err(SysError::ECHILD);
             }
 
             info!("wait: thread {} -> {:?}, sleep", self.thread.tid, target);
-
-            let eventbus = proc.eventbus.clone();
-            drop(proc);
 
             wait_for_event(eventbus.clone(), Event::CHILD_PROCESS_QUIT).await;
             eventbus.lock().clear(Event::CHILD_PROCESS_QUIT);
@@ -233,21 +224,12 @@ impl Syscall<'_> {
         // close file that FD_CLOEXEC is set
         let close_fds = proc
             .files
-            .iter()
-            .filter_map(|(fd, file_like)| {
-                if let FileLike::File(file) = file_like {
-                    if file.fd_cloexec {
-                        Some(*fd)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
+            .keys()
+            .cloned()
+            .filter(|fd| proc.is_fd_cloexec(*fd))
             .collect::<Vec<_>>();
         for fd in close_fds {
-            proc.files.remove(&fd);
+            proc.close_file(fd);
         }
 
         // Activate new page table

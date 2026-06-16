@@ -18,7 +18,7 @@ impl Syscall<'_> {
         /// The maximum semaphores per semaphore set
         const SEMMSL: usize = 256;
 
-        if nsems > SEMMSL {
+        if nsems == 0 || nsems > SEMMSL {
             return Err(SysError::EINVAL);
         }
 
@@ -112,6 +112,10 @@ impl Syscall<'_> {
 
     pub fn sys_shmget(&self, key: usize, size: usize, shmflg: usize) -> SysResult {
         info!("shmget: key: {}", key);
+
+        if size == 0 {
+            return Err(SysError::EINVAL);
+        }
 
         let shared_guard = ShmIdentifier::new_shared_guard(key, size);
         let id = self.process().shm_identifiers.add(shared_guard);
