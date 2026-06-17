@@ -37,6 +37,10 @@ name = "audit_cache_disk"
 path = "tests/audit/cache_disk.rs"
 
 [[test]]
+name = "audit_deadlock_chain"
+path = "tests/audit/deadlock_chain.rs"
+
+[[test]]
 name = "audit_ipc"
 path = "tests/audit/ipc.rs"
 

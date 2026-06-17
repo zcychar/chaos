@@ -31,6 +31,3 @@ modules/*/objs
 modules/*/target
 test/
 
-export/
-docs/
-chaos-tests/tests/audit/
