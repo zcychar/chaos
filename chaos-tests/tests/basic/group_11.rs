@@ -21,7 +21,7 @@ fn basic_fork_exec_workload() {
 
     let mut frames = Vec::new();
     for _ in 0..4 {
-        if let Some(f) = kern.pool.get(0) {
+        if let Some(f) = kern.pool.get_inner() {
             frames.push(f);
         }
     }
@@ -88,7 +88,7 @@ fn basic_mmap_file_io_workload() {
 
     assert!(check_access(0x1000, 0x2000));
 
-    let f = pool.get(0).unwrap();
+    let f = pool.get_inner().unwrap();
     let src = PgFrame::with_rc(2);
     let sp = SharedPage::new(f);
     let nf = sp.fault(&pool, &src);
