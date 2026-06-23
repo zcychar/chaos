@@ -30,7 +30,3 @@ modules/*/objs
 # Rust
 modules/*/target
 test/
-
-export/
-docs/
-chaos-tests/tests/audit/
