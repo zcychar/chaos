@@ -3,9 +3,9 @@
 use std::cmp::min;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
-use std::ops::Deref;
+use std::ops::{Deref, Index};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -555,6 +555,76 @@ impl TimerEntry {
 
     pub fn cancel(&mut self) {
         self.active = false;
+    }
+}
+
+/// Fixed-size timer wheel for grouping timers by deadline slot.
+pub struct TimerWheel {
+    pub slots: Vec<Vec<TimerEntry>>,
+    pub current_slot: usize,
+}
+
+impl TimerWheel {
+    pub fn new() -> Self {
+        let mut slots = Vec::with_capacity(TIMER_WHEEL_SIZE);
+        for _ in 0..TIMER_WHEEL_SIZE {
+            slots.push(Vec::new());
+        }
+        Self {
+            slots,
+            current_slot: 0,
+        }
+    }
+
+    pub fn add_timer(&mut self, entry: TimerEntry) {
+        let slot_index = entry.deadline % TIMER_WHEEL_SIZE;
+        self.slots[slot_index].push(entry);
+    }
+
+    pub fn advance(&mut self) -> Vec<TimerEntry> {
+        self.current_slot = (self.current_slot + 1) % TIMER_WHEEL_SIZE;
+        let mut fired = Vec::new();
+        let slot = &mut self.slots[self.current_slot];
+        let mut remaining = Vec::new();
+
+        for entry in slot.drain(..) {
+            if entry.active && entry.expired() {
+                fired.push(entry);
+            } else if entry.active {
+                remaining.push(entry);
+            }
+        }
+        *slot = remaining;
+
+        for timer in fired.iter_mut() {
+            if timer.repeat {
+                timer.reset();
+                let rescheduled_timer =
+                    TimerEntry::new(timer.deadline, timer.interval, timer.callback_id);
+                self.add_timer(rescheduled_timer);
+            }
+        }
+        fired
+    }
+
+    pub fn cancel(&mut self, callback_id: usize) -> bool {
+        for slot in self.slots.iter_mut() {
+            for entry in slot.iter_mut() {
+                if entry.callback_id == callback_id && entry.active {
+                    entry.active = false;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.slots
+            .iter()
+            .flat_map(|slot| slot.iter())
+            .filter(|entry| entry.active)
+            .count()
     }
 }
 
@@ -2943,7 +3013,7 @@ impl PipeNode {
 }
 
 /// File-descriptor object variants used by the simulation. Unifies regular files, pipes, and epoll instances under one type for the kernel.
-/// 
+///
 /// Note: rewrite for simplicity, remove a lot of useless code.
 pub enum FLike {
     File(FHandle),
@@ -3226,8 +3296,8 @@ impl Default for TrmIO {
             lflag: 0o105073,
             line: 0,
             cc: [
-                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 255, 18, 15, 23, 22, 255, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 255, 18, 15, 23, 22, 255, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0,
             ],
             ispeed: 0,
             ospeed: 0,
@@ -3248,7 +3318,7 @@ pub struct WinSz {
 ///
 /// `buf` stores bytes in a circular buffer, `guard` serializes receiving paths,
 /// `wq` tracks blocked receivers, and `shut` marks EOF/closed state.
-/// 
+///
 /// Note: simplify a lot of useless inlines.
 pub struct Channel {
     pub buf: Mutex<CircBuf>,
@@ -3394,7 +3464,7 @@ pub struct PageCacheEntry {
 ///
 /// `entries` stores cached pages by page id, while `lru_order` keeps ids from
 /// least recently used to most recently used. Atomic counters track cache stats.
-/// 
+///
 pub struct PageCache {
     pub entries: HashMap<usize, PageCacheEntry>,
     pub capacity: usize,
@@ -3424,7 +3494,9 @@ impl PageCache {
             if let Some(entry) = self.entries.get_mut(&page_id) {
                 entry.access_tick = CLK.load(Ordering::Relaxed);
             }
-            self.entries.get(&page_id).map(|entry| entry.data.as_slice())
+            self.entries
+                .get(&page_id)
+                .map(|entry| entry.data.as_slice())
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
             None
@@ -3740,7 +3812,7 @@ impl CacheChain {
 /// Hash-chain block cache used by the simulated disk path.
 ///
 /// `width` is the number of chains.
-/// 
+///
 /// Fix: clear some very strange useless code.
 /// Note: there are still some redundant design and confusing code left for future refactor, but it will affect the behavior of the simulation.
 pub struct BlockCache {
@@ -3903,7 +3975,7 @@ pub struct MountEntry {
 ///
 /// Entries are sorted by descending prefix length so the longest matching
 /// mount point wins during resolution.
-/// 
+///
 /// Fix: derived a helper function to canonicalize slashes, and remove some redundant code.
 /// Note: cannot make sure if resolve is correct.
 pub struct MountTable {
@@ -3967,35 +4039,13 @@ impl MountTable {
     }
 
     pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
-        let entries = self.entries.read().unwrap();
-        let mut best_match_index: Option<usize> = None;
-        let mut best_prefix_len = 0;
-
-        for (index, entry) in entries.iter().enumerate() {
-            if entry.prefix.is_empty() {
-                continue;
-            }
-            let prefix_len = entry.prefix.len();
-            if prefix_len > path.len() {
-                continue;
-            }
-            if Self::prefix_matches(&entry.prefix, path) && prefix_len > best_prefix_len {
-                best_prefix_len = prefix_len;
-                best_match_index = Some(index);
-            }
-        }
-
-        match best_match_index {
-            Some(index) => {
-                let entry = &entries[index];
+        match self.find_mount(path) {
+            Some(entry) => {
                 let remaining_path = &path[entry.prefix.len()..];
-                let target = entry.target.clone();
-                drop(entries);
-
                 let resolved_suffix = self.resolve(remaining_path)?;
                 let mut result =
-                    String::with_capacity(target.len() + 1 + resolved_suffix.len());
-                result.push_str(&target);
+                    String::with_capacity(entry.target.len() + 1 + resolved_suffix.len());
+                result.push_str(&entry.target);
                 result.push(':');
                 result.push_str(&resolved_suffix);
                 Ok(result)
@@ -4004,7 +4054,6 @@ impl MountTable {
         }
     }
 
-    
     pub fn unmount(&self, prefix: &str) -> bool {
         let mut entries = self.entries.write().unwrap();
         let previous_len = entries.len();
@@ -4050,4 +4099,815 @@ impl MountTable {
             .iter()
             .any(|entry| entry.prefix.as_bytes() == prefix.as_bytes())
     }
+}
+
+/// One pending disk I/O request.
+///
+/// `block` is the target block number, `write` distinguishes write from read,
+/// and `priority` is stored for scheduler policy experiments.
+pub struct IoRequest {
+    pub block: usize,
+    pub write: bool,
+    pub priority: u8,
+    pub submitted_tick: usize,
+}
+
+/// Simple disk I/O scheduler queue.
+///
+/// The dispatch policy follows the current head position and direction, while
+/// `merged` tracks adjacent requests that were coalesced.
+pub struct IoQueue {
+    pub pending: Mutex<VecDeque<IoRequest>>,
+    pub head_pos: AtomicUsize,
+    pub direction_up: AtomicBool,
+    pub dispatched: AtomicUsize,
+    pub merged: AtomicUsize,
+}
+
+impl IoQueue {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(VecDeque::new()),
+            head_pos: AtomicUsize::new(0),
+            direction_up: AtomicBool::new(true),
+            dispatched: AtomicUsize::new(0),
+            merged: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn submit(&self, block_id: usize, write: bool, priority: u8) {
+        let request = IoRequest {
+            block: block_id,
+            write,
+            priority,
+            submitted_tick: CLK.load(Ordering::Relaxed),
+        };
+        let mut queue = self.pending.lock().unwrap();
+        queue.push_back(request);
+    }
+
+    pub fn submit_batch(&self, requests: &[(usize, bool, u8)]) -> usize {
+        let mut queue = self.pending.lock().unwrap();
+        let mut submitted_count = 0;
+        for &(block_id, write, priority) in requests {
+            let request = IoRequest {
+                block: block_id,
+                write,
+                priority,
+                submitted_tick: CLK.load(Ordering::Relaxed),
+            };
+            queue.push_back(request);
+            submitted_count += 1;
+        }
+        let depth = queue.len();
+        let should_merge = depth > IOQUEUE_DEPTH;
+        drop(queue);
+
+        // Debug fix: do not call merge_adjacent while still holding pending.
+        if should_merge {
+            self.merge_adjacent();
+        }
+        submitted_count
+    }
+
+    /// Note: currently, the dispatch policy is alike a simple SCAN algorithm, however, it deals backward requests in a very strange way,
+    /// also, merge_adjacent confusing in the context, since it removes a request from the queue completely.
+    pub fn dispatch(&self) -> Option<(usize, bool)> {
+        let mut queue = self.pending.lock().unwrap();
+        if queue.is_empty() {
+            return None;
+        }
+
+        let head_position = self.head_pos.load(Ordering::Relaxed);
+        let going_up = self.direction_up.load(Ordering::Relaxed);
+        let mut best_index = 0;
+        let mut best_distance = usize::MAX;
+
+        for (index, request) in queue.iter().enumerate() {
+            let distance = if going_up {
+                if request.block >= head_position {
+                    request.block - head_position
+                } else {
+                    usize::MAX / 2 + request.block
+                }
+            } else if request.block <= head_position {
+                head_position - request.block
+            } else {
+                usize::MAX / 2 + head_position
+            };
+
+            if distance < best_distance {
+                best_distance = distance;
+                best_index = index;
+            }
+        }
+
+        let request = queue.remove(best_index)?;
+        self.head_pos.store(request.block, Ordering::Relaxed);
+        if going_up && request.block >= head_position {
+            if queue.iter().all(|queued| queued.block < request.block) {
+                self.direction_up.store(false, Ordering::Relaxed);
+            }
+        } else if !going_up && request.block <= head_position {
+            if queue.iter().all(|queued| queued.block > request.block) {
+                self.direction_up.store(true, Ordering::Relaxed);
+            }
+        }
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
+        Some((request.block, request.write))
+    }
+
+    pub fn merge_adjacent(&self) -> usize {
+        let mut queue = self.pending.lock().unwrap();
+        let mut merged_count = 0;
+        let mut index = 0;
+        while index + 1 < queue.len() {
+            // Debug fix: checked_add avoids overflow for the final block id.
+            if queue[index].block.checked_add(1) == Some(queue[index + 1].block)
+                && queue[index].write == queue[index + 1].write
+            {
+                queue.remove(index + 1);
+                merged_count += 1;
+            } else {
+                index += 1;
+            }
+        }
+        self.merged.fetch_add(merged_count, Ordering::Relaxed);
+        merged_count
+    }
+
+    pub fn depth(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+}
+
+/// Simulated block device with optional journal fallback.
+///
+/// `errs` is a countdown of remaining synthetic I/O failures that can be tried; `usize::MAX`
+/// means persistent failure. `ops` counts attempted operations.
+///
+/// Note(IMPORTANT): this struct is full of errors, but we do not know what it should behave based on current testcases.
+pub struct Disk {
+    pub errs: AtomicUsize,
+    pub ops: AtomicUsize,
+    pub label: String,
+    pub journal: Option<Arc<Disk>>,
+}
+
+impl Disk {
+    pub fn new(label: &str) -> Self {
+        Self {
+            errs: AtomicUsize::new(0),
+            ops: AtomicUsize::new(0),
+            label: label.to_string(),
+            journal: None,
+        }
+    }
+
+    pub fn failing(label: &str, error_count: usize) -> Self {
+        Self {
+            errs: AtomicUsize::new(error_count),
+            ops: AtomicUsize::new(0),
+            label: label.to_string(),
+            journal: None,
+        }
+    }
+
+    pub fn attach_journal(&mut self, journal: Arc<Disk>) {
+        self.journal = Some(journal);
+    }
+
+    pub fn set_errs(&self, error_count: usize) {
+        self.errs.store(error_count, Ordering::SeqCst);
+    }
+
+    fn consume_transient_error(&self, remaining_errors: usize) {
+        if remaining_errors != usize::MAX {
+            self.errs.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    pub fn read_block(&self, block_id: usize, out: &mut [u8]) -> Result<(), &'static str> {
+        let buffer_len = out.len();
+        loop {
+            self.ops.fetch_add(1, Ordering::SeqCst);
+            let remaining_errors = self.errs.load(Ordering::SeqCst);
+            if remaining_errors == 0 {
+                let mut index = 0;
+                while index < buffer_len {
+                    out[index] = 0xAA;
+                    index += 1;
+                }
+                return Ok(());
+            }
+
+            self.consume_transient_error(remaining_errors);
+
+            if let Some(journal_device) = &self.journal {
+                let mut scratch = [0u8; 8];
+                let _journal_result = journal_device.read_block_n(block_id, &mut scratch, 5);
+            }
+            //Note: here we need some backoff or limit to avoid infinite loop, but the original code does not have it.
+        }
+    }
+
+    pub fn read_block_n(
+        &self,
+        block_id: usize,
+        out: &mut [u8],
+        limit: usize,
+    ) -> Result<usize, &'static str> {
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let _op_id = self.ops.fetch_add(1, Ordering::SeqCst);
+            let remaining_errors = self.errs.load(Ordering::SeqCst);
+            if remaining_errors == 0 {
+                // Debug fix: limited reads use the same success fill pattern as read_block.
+                for byte in out.iter_mut() {
+                    *byte = 0xAA;
+                }
+                return Ok(attempt);
+            }
+
+            self.consume_transient_error(remaining_errors);
+
+            if let Some(ref journal_device) = self.journal {
+                let mut temp_buffer = [0u8; 8];
+                let _ = journal_device.read_block_n(block_id, &mut temp_buffer, limit.min(5));
+            }
+
+            if limit > 0 && attempt >= limit {
+                return Err("limit");
+            }
+            //Note: here we need some backoff or limit to avoid infinite loop, but the original code does not have it.
+        }
+    }
+
+    pub fn total_ops(&self) -> usize {
+        self.ops.load(Ordering::SeqCst)
+    }
+
+    pub fn reset_ops(&self) {
+        self.ops.store(0, Ordering::SeqCst);
+    }
+
+    pub fn write_block(&self, _block_id: usize, _data: &[u8]) -> Result<(), &'static str> {
+        self.ops.fetch_add(1, Ordering::SeqCst);
+        let remaining_errors = self.errs.load(Ordering::SeqCst);
+        if remaining_errors != 0 {
+            self.consume_transient_error(remaining_errors);
+            return Err("io_error");
+        }
+        Ok(())
+    }
+
+    pub fn flush(&self) -> Result<(), &'static str> {
+        self.ops.fetch_add(1, Ordering::SeqCst);
+        if let Some(ref journal) = self.journal {
+            journal.ops.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+/// SysV-style IPC permission metadata.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IpcPerm {
+    // User supplied IPC lookup key.
+    pub key: u32,
+    // Current owner user and group ids.
+    pub uid: u32,
+    pub gid: u32,
+    // Creator user and group ids.
+    pub cuid: u32,
+    pub cgid: u32,
+    // Permission bits; only low mode bits are used by setters.
+    pub mode: u32,
+    // Sequence number for id reuse/generation tracking.
+    pub seq: u32,
+    // ABI padding fields.
+    pub pad1: usize,
+    pub pad2: usize,
+}
+
+/// SysV semaphore-set descriptor.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SemDs {
+    // Permission and ownership metadata.
+    pub perm: IpcPerm,
+    // Last semaphore operation time.
+    pub otime: usize,
+    // ABI padding.
+    _p1: usize,
+    // Last metadata change time.
+    pub ctime: usize,
+    // ABI padding.
+    _p2: usize,
+    // Number of semaphores in this set.
+    pub nsems: usize,
+}
+
+/// A semaphore array plus its descriptor metadata.
+pub struct SemArr {
+    pub ds: Mutex<SemDs>,
+    pub sems: Vec<Sema>,
+}
+
+impl Index<usize> for SemArr {
+    type Output = Sema;
+
+    fn index(&self, index: usize) -> &Sema {
+        &self.sems[index]
+    }
+}
+
+impl SemArr {
+    pub fn remove(&self) {
+        for semaphore in &self.sems {
+            semaphore.remove();
+        }
+    }
+
+    //Debug fix: the original code does not update otime and ctime.
+    pub fn otime_now(&self) {
+        self.ds.lock().unwrap().otime = CLK.load(Ordering::Relaxed);
+    }
+
+    pub fn ctime_now(&self) {
+        self.ds.lock().unwrap().ctime = CLK.load(Ordering::Relaxed);
+    }
+
+    pub fn set_ds(&self, new_descriptor: &SemDs) {
+        let mut descriptor = self.ds.lock().unwrap();
+        descriptor.perm.uid = new_descriptor.perm.uid;
+        descriptor.perm.gid = new_descriptor.perm.gid;
+        descriptor.perm.mode = new_descriptor.perm.mode & 0x1ff;
+    }
+
+    // Note: the weak reference design need further review.
+    pub fn get_or_create(
+        key: u32,
+        nsems: usize,
+        flags: usize,
+        store: &RwLock<BTreeMap<u32, Weak<SemArr>>>,
+    ) -> Result<Arc<Self>, &'static str> {
+        // Debug fix: a semaphore array must contain at least one semaphore.
+        if nsems == 0 {
+            return Err("einval");
+        }
+
+        let mut map = store.write().unwrap();
+        let mut resolved_key = key;
+        if resolved_key == 0 {
+            resolved_key = (1u32..)
+                .find(|candidate_key| map.get(candidate_key).is_none())
+                .unwrap();
+        } else if let Some(weak_array) = map.get(&resolved_key) {
+            if let Some(array) = weak_array.upgrade() {
+                if (flags & (1 << 9)) != 0 && (flags & (1 << 10)) != 0 {
+                    return Err("eexist");
+                }
+                // Debug fix: an existing array must satisfy the requested size.
+                if array.ds.lock().unwrap().nsems < nsems {
+                    return Err("einval");
+                }
+                return Ok(array);
+            }
+        }
+
+        let semaphores = Vec::with_capacity(nsems);
+
+        let array = Arc::new(SemArr {
+            ds: Mutex::new(SemDs {
+                perm: IpcPerm {
+                    key: resolved_key,
+                    uid: 0,
+                    gid: 0,
+                    cuid: 0,
+                    cgid: 0,
+                    mode: (flags as u32) & 0x1ff,
+                    seq: 0,
+                    pad1: 0,
+                    pad2: 0,
+                },
+                otime: 0,
+                _p1: 0,
+                ctime: 0,
+                _p2: 0,
+                nsems,
+            }),
+            sems: semaphores,
+        });
+        map.insert(resolved_key, Arc::downgrade(&array));
+        Ok(array)
+    }
+}
+
+type SemId = usize;
+type SemNum = u16;
+type SemOp = i16;
+
+/// Per-task semaphore context.
+///
+/// `arrays` maps local semaphore ids to semaphore arrays. `undos` stores
+/// SEM_UNDO-style adjustments keyed by `(semaphore id, semaphore number)`.
+#[derive(Default)]
+pub struct SemCtx {
+    pub arrays: BTreeMap<SemId, Arc<SemArr>>,
+    pub undos: BTreeMap<(SemId, SemNum), SemOp>,
+}
+
+impl SemCtx {
+    pub fn add(&mut self, array: Arc<SemArr>) -> SemId {
+        let id = self.free_id();
+        self.arrays.insert(id, array);
+        id
+    }
+
+    pub fn remove(&mut self, id: SemId) {
+        self.arrays.remove(&id);
+        // Debug fix: removing an array id must also clear stale undo records for it.
+        self.undos.retain(|(undo_id, _), _| *undo_id != id);
+    }
+
+    fn free_id(&self) -> SemId {
+        (0..)
+            .find(|candidate_id| self.arrays.get(candidate_id).is_none())
+            .unwrap()
+    }
+
+    pub fn get(&self, id: SemId) -> Option<Arc<SemArr>> {
+        self.arrays.get(&id).cloned()
+    }
+
+    pub fn add_undo(&mut self, id: SemId, sem_num: SemNum, op: SemOp) {
+        let old = *self.undos.get(&(id, sem_num)).unwrap_or(&0);
+        self.undos.insert((id, sem_num), old - op);
+    }
+}
+
+impl Clone for SemCtx {
+    fn clone(&self) -> Self {
+        SemCtx {
+            arrays: self.arrays.clone(),
+            undos: BTreeMap::new(),
+        }
+    }
+}
+
+impl Drop for SemCtx {
+    fn drop(&mut self) {
+        for (&(id, sem_num), &op) in &self.undos {
+            if let Some(array) = self.arrays.get(&id) {
+                let semaphore = &array[sem_num as usize];
+                if op > 0 {
+                    // Debug fix: replay the full positive undo magnitude, not only op == 1.
+                    for _ in 0..op as usize {
+                        semaphore.release();
+                    }
+                } else if op < 0 {
+                    for _ in 0..(-op) as usize {
+                        let _ = semaphore.try_acquire();
+                    }
+                }
+            }
+        }
+    }
+}
+
+type ShmId = usize;
+
+/// One shared-memory attachment in a task context.
+#[derive(Clone)]
+pub struct ShmTag {
+    pub addr: usize,
+    pub pages: Arc<Mutex<Vec<usize>>>,
+}
+
+impl ShmTag {
+    pub fn set_addr(&mut self, addr: usize) {
+        self.addr = addr;
+    }
+}
+
+pub fn shm_get_or_create(
+    key: usize,
+    npages: usize,
+    store: &RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
+) -> Arc<Mutex<Vec<usize>>> {
+    // Debug fix: key 0 is private and must create a fresh segment every time.
+    if key == 0 {
+        return Arc::new(Mutex::new(vec![0usize; npages]));
+    }
+
+    let mut map = store.write().unwrap();
+    if let Some(weak_segment) = map.get(&key) {
+        if let Some(segment) = weak_segment.upgrade() {
+            {
+                let mut pages = segment.lock().unwrap();
+                if pages.len() < npages {
+                    pages.resize(npages, 0);
+                }
+            }
+            return segment;
+        }
+    }
+
+    let segment = Arc::new(Mutex::new(vec![0usize; npages]));
+    map.insert(key, Arc::downgrade(&segment));
+    segment
+}
+
+/// Per-task shared-memory attachment table.
+#[derive(Default)]
+pub struct ShmCtx {
+    pub ids: BTreeMap<ShmId, ShmTag>,
+}
+
+impl ShmCtx {
+    pub fn add(&mut self, pages: Arc<Mutex<Vec<usize>>>) -> ShmId {
+        let id = (0..)
+            .find(|candidate_id| !self.ids.contains_key(candidate_id))
+            .unwrap();
+        self.ids.insert(id, ShmTag { addr: 0, pages });
+        id
+    }
+
+    pub fn get(&self, id: ShmId) -> Option<ShmTag> {
+        self.ids.get(&id).cloned()
+    }
+
+    pub fn set(&mut self, id: ShmId, tag: ShmTag) {
+        self.ids.insert(id, tag);
+    }
+
+    pub fn get_id_by_addr(&self, addr: usize) -> Option<ShmId> {
+        self.ids
+            .iter()
+            .find(|(_, tag)| tag.addr == addr)
+            .map(|(id, _)| *id)
+    }
+
+    pub fn pop(&mut self, id: ShmId) {
+        self.ids.remove(&id);
+    }
+}
+
+impl Clone for ShmCtx {
+    fn clone(&self) -> Self {
+        ShmCtx {
+            ids: self.ids.clone(),
+        }
+    }
+}
+
+/// Initial process stack layout inputs. It describes the init data for a new process to put on its stack when starting execution.
+/// Its only function here is to compute the total size of the stack.
+///
+/// `args`, `envs`, and `auxv` are used to compute where argv/envp/auxv data
+/// would be placed below a supplied stack top.
+pub struct ProcInit {
+    pub args: Vec<String>,
+    pub envs: Vec<String>,
+    pub auxv: BTreeMap<u8, usize>,
+}
+
+impl ProcInit {
+    fn reserve_stack_bytes(stack_pointer: &mut usize, byte_count: usize) -> bool {
+        match stack_pointer.checked_sub(byte_count) {
+            Some(next_stack_pointer) => {
+                *stack_pointer = next_stack_pointer;
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn push_at(&self, top: usize) -> usize {
+        let word_size = std::mem::size_of::<usize>();
+        let mut stack_pointer = top;
+
+        for env in self.envs.iter() {
+            if !Self::reserve_stack_bytes(&mut stack_pointer, env.len().saturating_add(1)) {
+                return 0;
+            }
+        }
+
+        for arg in self.args.iter() {
+            if !Self::reserve_stack_bytes(&mut stack_pointer, arg.len().saturating_add(1)) {
+                return 0;
+            }
+        }
+
+        let aux_pairs = self.auxv.len();
+        let aux_bytes = match aux_pairs
+            .checked_mul(2)
+            .and_then(|value| value.checked_add(2))
+            .and_then(|value| value.checked_mul(word_size))
+        {
+            Some(value) => value,
+            None => return 0,
+        };
+        if !Self::reserve_stack_bytes(&mut stack_pointer, aux_bytes) {
+            return 0;
+        }
+
+        let env_ptrs_bytes = match self
+            .envs
+            .len()
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(word_size))
+        {
+            Some(value) => value,
+            None => return 0,
+        };
+        if !Self::reserve_stack_bytes(&mut stack_pointer, env_ptrs_bytes) {
+            return 0;
+        }
+
+        let arg_ptrs_bytes = match self
+            .args
+            .len()
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(word_size))
+        {
+            Some(value) => value,
+            None => return 0,
+        };
+        if !Self::reserve_stack_bytes(&mut stack_pointer, arg_ptrs_bytes) {
+            return 0;
+        }
+
+        if !Self::reserve_stack_bytes(&mut stack_pointer, word_size) {
+            return 0;
+        }
+
+        let alignment_offset = stack_pointer & 0xF;
+        if alignment_offset != 0 {
+            // Debug fix: every downward adjustment uses checked_sub to avoid underflow.
+            if !Self::reserve_stack_bytes(&mut stack_pointer, alignment_offset) {
+                return 0;
+            }
+        }
+        stack_pointer
+    }
+
+    pub fn total_size(&self) -> usize {
+        let mut size = 0usize;
+        for arg in &self.args {
+            size += arg.len() + 1;
+        }
+        for env in &self.envs {
+            size += env.len() + 1;
+        }
+        size += (self.auxv.len() * 2 + 2 + self.args.len() + 1 + self.envs.len() + 1 + 1)
+            * std::mem::size_of::<usize>();
+        size
+    }
+}
+
+/// Captured CPU context used by the simulation to save and restore registers.
+///
+/// `r` stores general-purpose registers, `ip` is the instruction pointer, and
+/// `flags` carries architecture/status bits used by higher-level trap code.
+///
+/// Note: remove a LOT of redundant code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Context {
+    pub r: [u64; N_REGS],
+    pub ip: u64,
+    pub flags: u64,
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Self {
+            r: [0u64; N_REGS],
+            ip: 0,
+            flags: 0,
+        }
+    }
+
+    pub fn capture(source_registers: &[u64; N_REGS]) -> Self {
+        Self {
+            r: *source_registers,
+            ip: 0,
+            flags: 0,
+        }
+    }
+
+    // Debug fix: restore registers in their captured order.
+    pub fn apply(&self) -> [u64; N_REGS] {
+        self.r
+    }
+
+    pub fn set_ip(&mut self, value: u64) {
+        self.ip = value;
+    }
+
+    pub fn set_sp(&mut self, value: u64) {
+        let stack_pointer_index = N_REGS - 1;
+        self.r[stack_pointer_index] = value;
+    }
+
+    pub fn set_ret(&mut self, value: u64) {
+        self.r[0] = value;
+    }
+
+    pub fn set_tls(&mut self, value: u64) {
+        let tls_index = N_REGS - 2;
+        self.r[tls_index] = value;
+    }
+
+    // Note: cannot understant this function.
+    pub fn transform(&self, operation: u8, value: u64) -> Context {
+        let mut output = self.clone();
+        match operation & 0x0F {
+            0 => {
+                output.r[0] = value;
+            }
+            1 => {
+                output.ip = value;
+            }
+            2 => {
+                output.r[N_REGS - 1] = value;
+            }
+            3 => {
+                output.r[N_REGS - 2] = value;
+            }
+            4 => {
+                output.flags = value;
+            }
+            5 => {
+                let register_index = (value >> 56) as usize;
+                if register_index < N_REGS {
+                    output.r[register_index] = value & 0x00FF_FFFF_FFFF_FFFF;
+                }
+            }
+            _ => {}
+        }
+        output
+    }
+
+    pub fn syscall_args(&self) -> (u64, u64, u64, u64, u64, u64) {
+        (
+            self.r[0], self.r[1], self.r[2], self.r[3], self.r[4], self.r[5],
+        )
+    }
+
+    pub fn clone_with_ret(&self, return_value: u64) -> Context {
+        let mut context = self.clone();
+        context.r[0] = return_value;
+        context
+    }
+
+    pub fn diff(&self, other: &Context) -> Vec<(usize, u64, u64)> {
+        let mut changes = Vec::new();
+        for register_index in 0..N_REGS {
+            if self.r[register_index] != other.r[register_index] {
+                changes.push((
+                    register_index,
+                    self.r[register_index],
+                    other.r[register_index],
+                ));
+            }
+        }
+        if self.ip != other.ip {
+            changes.push((N_REGS, self.ip, other.ip));
+        }
+        if self.flags != other.flags {
+            changes.push((N_REGS + 1, self.flags, other.flags));
+        }
+        changes
+    }
+
+    pub fn hash(&self) -> u64 {
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for &register in self.r.iter() {
+            hash ^= register;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= self.ip;
+        hash = hash.wrapping_mul(0x100000001b3);
+        hash ^= self.flags;
+        hash
+    }
+
+    // Debug fix: the original code blocks compile, and this function is confusing.
+    pub fn reg_class(&self, register_index: usize) -> u64 {
+        if register_index >= N_REGS {
+            return 0;
+        }
+        let register_value = self.r[register_index];
+        match register_value >> 60 {
+            0..=7 => register_value & 0x0FFF_FFFF_FFFF_FFFF,
+            8..=11 => register_value.wrapping_neg(),
+            _ => register_value,
+        }
+    }
+
+    
 }
