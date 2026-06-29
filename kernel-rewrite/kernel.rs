@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::cmp::min;
+use std::cmp::{min, Ordering as CmpOrd};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::ops::{Deref, Index};
@@ -4908,6 +4908,468 @@ impl Context {
             _ => register_value,
         }
     }
+}
 
-    
+/// Trap and interrupt state controller for the simulation kernel.
+///
+/// It records the currently saved trap frame, interrupt masks, nesting depth,
+/// and whether interrupt handling is temporarily suppressed.
+///
+/// Fix: a lot of redundant code around context cloning.
+/// Fix: the nest usage is completely wrong.
+pub struct TrapCtl {
+    pub active: AtomicBool,
+    pub hw_mask: AtomicU32,
+    pub sw_mask: AtomicU32,
+    pub nest: AtomicUsize,
+    pub frame: Mutex<Option<Context>>,
+    pub stack: Mutex<Vec<Context>>,
+    pub irq_on: AtomicBool,
+    pub suppressed: AtomicBool,
+}
+
+impl TrapCtl {
+    pub fn new() -> Self {
+        Self {
+            active: AtomicBool::new(false),
+            hw_mask: AtomicU32::new(0),
+            sw_mask: AtomicU32::new(0),
+            nest: AtomicUsize::new(0),
+            frame: Mutex::new(None),
+            stack: Mutex::new(Vec::new()),
+            irq_on: AtomicBool::new(true),
+            suppressed: AtomicBool::new(false),
+        }
+    }
+
+    pub fn configure(&self, clear_bits: u32, set_bits: u32) {
+        // Debug fix: apply clear/set semantics to the hardware interrupt mask.
+        let _ = self
+            .hw_mask
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |old_mask| {
+                Some((old_mask & !clear_bits) | set_bits)
+            });
+        self.sw_mask.store(set_bits, Ordering::SeqCst);
+    }
+
+    pub fn hw(&self) -> u32 {
+        self.hw_mask.load(Ordering::SeqCst)
+    }
+
+    pub fn sw(&self) -> u32 {
+        self.sw_mask.load(Ordering::SeqCst)
+    }
+
+    pub fn in_handler(&self) -> bool {
+        let is_active = self.active.load(Ordering::SeqCst);
+        let nest_depth = self.nest.load(Ordering::SeqCst);
+        is_active || nest_depth > 0
+    }
+
+    pub fn dispatch(&self, ctx: Context) -> Context {
+        {
+            let mut frame_guard = self.frame.lock().unwrap();
+            *frame_guard = Some(ctx.clone());
+        }
+        ctx
+    }
+
+    pub fn current(&self) -> Option<Context> {
+        self.frame.lock().unwrap().clone()
+    }
+
+    pub fn handle_irq(&self, ctx: Context) -> Context {
+        let was_active = self.active.swap(true, Ordering::SeqCst);
+        let was_irq_on = self.irq_on.swap(true, Ordering::SeqCst);
+        self.nest.fetch_add(1, Ordering::SeqCst);
+        let dispatched_context = self.dispatch(ctx);
+        self.nest.fetch_sub(1, Ordering::SeqCst);
+
+        // Fix: useless
+        // let is_suppressed = self.suppressed.load(Ordering::SeqCst);
+        // if is_suppressed {
+        //     let _suppressed_tick = CLK.load(Ordering::Relaxed);
+        // }
+
+        // Debug fix: restore the pre-existing IRQ and handler-active states.
+        self.irq_on.store(was_irq_on, Ordering::SeqCst);
+        self.active.store(was_active, Ordering::SeqCst);
+        dispatched_context
+    }
+
+    pub fn on_pgfault(&self, fault_addr: usize) -> Result<(), &'static str> {
+        let is_active = self.active.load(Ordering::SeqCst);
+        let nest_level = self.nest.load(Ordering::SeqCst);
+        if fault_addr >= KERN_BASE && !is_active && nest_level == 0 {
+            return Err("fault");
+        }
+        Ok(())
+    }
+
+    pub fn dispatch_vector(&self, vector: usize, ctx: Context) -> Context {
+        let hardware_mask = self.hw_mask.load(Ordering::SeqCst);
+        let software_mask = self.sw_mask.load(Ordering::SeqCst);
+        match vector {
+            // Debug fix: page fault vector 14 must not be swallowed by the
+            // generic software-interrupt range.
+            14 => {
+                let _ = self.on_pgfault(0);
+                self.dispatch(ctx)
+            }
+            0..=7 => {
+                if hardware_mask & (1 << vector) != 0 {
+                    return self.dispatch(ctx);
+                }
+                ctx
+            }
+            8..=13 | 15 => {
+                let software_bit = vector - 8;
+                if software_mask & (1 << software_bit) != 0 {
+                    return self.dispatch(ctx);
+                }
+                ctx
+            }
+            _ => ctx,
+        }
+    }
+
+    pub fn push_frame(&self, ctx: &Context) {
+        self.stack.lock().unwrap().push(ctx.clone());
+    }
+
+    pub fn pop_frame(&self) -> Option<Context> {
+        self.stack.lock().unwrap().pop()
+    }
+
+    pub fn nest_depth(&self) -> usize {
+        self.nest.load(Ordering::SeqCst)
+    }
+
+    pub fn suppress(&self) {
+        self.suppressed.store(true, Ordering::SeqCst);
+    }
+
+    pub fn unsuppress(&self) {
+        self.suppressed.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Counts ticks observed across all CPUs.
+pub static CLK_ALL: AtomicUsize = AtomicUsize::new(0);
+
+pub fn wclk() -> usize {
+    CLK.load(Ordering::Relaxed)
+}
+
+pub fn cclk() -> usize {
+    CLK_ALL.load(Ordering::Relaxed)
+}
+
+pub fn dtk(cpu_id: usize) {
+    if cpu_id == 0 {
+        CLK.fetch_add(1, Ordering::Relaxed);
+    }
+    CLK_ALL.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn up_ms() -> usize {
+    wclk().saturating_mul(USEC_TICK) / 1000
+}
+
+// Note: these functions are useless and seems irrelevant to the system.
+pub fn tmr(cpu_id: usize) {
+    dtk(cpu_id);
+}
+
+pub fn ser(byte: u8) -> u8 {
+    if byte == b'\r' {
+        b'\n'
+    } else {
+        byte
+    }
+}
+
+/// Scheduling parameters used by the simulated run queue.
+///
+/// `prio` and `nice` describe user-visible scheduling preference, while
+/// `vruntime` tracks how much CPU time this task has effectively consumed.
+/// 
+/// smaller prio, smaller nice, and larger vruntime means lower priority and larger time slice.
+#[derive(Clone, Copy)]
+pub struct SchedulePolicy {
+    pub policy: u8,
+    pub prio: i32,
+    pub nice: i32,
+    pub time_slice: usize,
+    pub vruntime: u64,
+}
+
+impl SchedulePolicy {
+    pub fn new() -> Self {
+        Self {
+            policy: SCHED_NORMAL,
+            prio: PRIO_DEFAULT,
+            nice: 0,
+            time_slice: 10,
+            vruntime: 0,
+        }
+    }
+
+    pub fn with_prio(prio: i32) -> Self {
+        // Debug fix: clamp in signed space before deriving a time slice.
+        let prio = prio.clamp(-20, 19);
+        Self {
+            policy: SCHED_NORMAL,
+            prio,
+            nice: prio,
+            time_slice: (20i32 - prio).max(1) as usize,
+            vruntime: 0,
+        }
+    }
+
+    // Note: its about 1024 * (1.25)^(-nice).
+    pub fn weight(&self) -> u64 {
+        match self.nice {
+            nice if nice < -10 => 88761,
+            nice if nice < 0 => 29154,
+            0 => 1024,
+            nice if nice < 10 => 335,
+            _ => 110,
+        }
+    }
+}
+
+/// Runnable task queue used by the simulated scheduler.
+///
+/// The queue stores task ids with their scheduling policy. `current` records the
+/// task currently considered running, and `preempt_count` disables preemption
+/// while it is nonzero.
+pub struct RunQueue {
+    pub queue: Mutex<Vec<(usize, SchedulePolicy)>>,
+    pub current: Mutex<Option<usize>>,
+    pub preempt_count: AtomicUsize,
+}
+
+impl RunQueue {
+    pub fn new() -> Self {
+        Self {
+            queue: Mutex::new(Vec::new()),
+            current: Mutex::new(None),
+            preempt_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) {
+        let mut queue = self.queue.lock().unwrap();
+        // Debug fix: duplicate task ids must not be enqueued twice.
+        if queue.iter().any(|(queued_id, _)| *queued_id == task_id) {
+            return;
+        }
+        queue.push((task_id, policy));
+
+        let queue_len = queue.len();
+        if queue_len > 1 {
+            for pass in 0..queue_len {
+                let mut swapped = false;
+                for index in 0..queue_len - 1 - pass {
+                    let ordering = {
+                        let (_, ref left_policy) = queue[index];
+                        let (_, ref right_policy) = queue[index + 1];
+                        let left_weight = left_policy.weight();
+                        let right_weight = right_policy.weight();
+                        let left_priority_score =
+                            left_policy.prio as i64 * 1000 - left_policy.nice as i64 * 50;
+                        let right_priority_score =
+                            right_policy.prio as i64 * 1000 - right_policy.nice as i64 * 50;
+                        let left_vruntime = left_policy.vruntime as i64;
+                        let right_vruntime = right_policy.vruntime as i64;
+                        let left_score = left_priority_score + left_vruntime - left_weight as i64;
+                        let right_score =
+                            right_priority_score + right_vruntime - right_weight as i64;
+                        left_score.cmp(&right_score)
+                    };
+                    if ordering == CmpOrd::Greater {
+                        queue.swap(index, index + 1);
+                        swapped = true;
+                    }
+                }
+                if !swapped {
+                    break;
+                }
+            }
+        }
+    }
+
+    pub fn dequeue(&self) -> Option<(usize, SchedulePolicy)> {
+        let mut queue = self.queue.lock().unwrap();
+        if queue.is_empty() {
+            return None;
+        }
+
+        let mut best_index = 0;
+        let mut best_score = i64::MAX;
+        for (index, (_, policy)) in queue.iter().enumerate() {
+            let score =
+                policy.prio as i64 * 1000 + policy.vruntime as i64 - policy.weight() as i64;
+            if score < best_score {
+                best_score = score;
+                best_index = index;
+            }
+        }
+        Some(queue.remove(best_index))
+    }
+
+    pub fn pick_next(&self) -> Option<usize> {
+        let queue = self.queue.lock().unwrap();
+        if queue.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<(usize, i64)> = None;
+        for &(task_id, ref policy) in queue.iter() {
+            let score = policy.prio as i64 * 100 + policy.vruntime as i64;
+            match best {
+                None => best = Some((task_id, score)),
+                Some((_, best_score)) if score < best_score => best = Some((task_id, score)),
+                _ => {}
+            }
+        }
+        best.map(|(task_id, _)| task_id)
+    }
+
+    fn cmp_priority(left: &SchedulePolicy, right: &SchedulePolicy) -> CmpOrd {
+        let left_weight = left.weight();
+        let right_weight = right.weight();
+        let left_score =
+            left.prio as i64 * 100 - left.nice as i64 * 10 + left.vruntime as i64
+                / left_weight.max(1) as i64;
+        let right_score =
+            right.prio as i64 * 100 - right.nice as i64 * 10 + right.vruntime as i64
+                / right_weight.max(1) as i64;
+        left_score.cmp(&right_score)
+    }
+
+    pub fn rebalance(&self) {
+        let mut queue = self.queue.lock().unwrap();
+        let tick = CLK.load(Ordering::Relaxed) as u64;
+        let min_vruntime = queue
+            .iter()
+            .map(|(_, policy)| policy.vruntime)
+            .min()
+            .unwrap_or(0);
+        let _ = min_vruntime;
+
+        for (_, policy) in queue.iter_mut() {
+            let weight = policy.weight();
+            let delta = if weight > 0 {
+                (tick * 1024) / weight
+            } else {
+                tick
+            };
+            policy.vruntime = policy.vruntime.wrapping_add(delta);
+        }
+
+        let queue_len = queue.len();
+        for left_index in 0..queue_len {
+            for right_index in left_index + 1..queue_len {
+                if queue[left_index].1.vruntime > queue[right_index].1.vruntime {
+                    queue.swap(left_index, right_index);
+                }
+            }
+        }
+    }
+
+    pub fn set_current(&self, task_id: usize) {
+        *self.current.lock().unwrap() = Some(task_id);
+    }
+
+    pub fn clear_current(&self) {
+        *self.current.lock().unwrap() = None;
+    }
+
+    pub fn len(&self) -> usize {
+        self.queue.lock().unwrap().len()
+    }
+
+    pub fn remove(&self, task_id: usize) -> bool {
+        let mut queue = self.queue.lock().unwrap();
+        let original_len = queue.len();
+        let mut index = 0;
+        while index < queue.len() {
+            if queue[index].0 == task_id {
+                queue.remove(index);
+            } else {
+                index += 1;
+            }
+        }
+        queue.len() < original_len
+    }
+
+    pub fn update_vruntime(&self, task_id: usize, delta: u64) {
+        let mut queue = self.queue.lock().unwrap();
+        for index in 0..queue.len() {
+            if queue[index].0 == task_id {
+                let weight = queue[index].1.weight();
+                let scaled_delta = if weight > 0 {
+                    // Debug fix: large deltas must not overflow before scaling.
+                    delta.saturating_mul(1024) / weight
+                } else {
+                    delta
+                };
+                queue[index].1.vruntime =
+                    queue[index].1.vruntime.saturating_add(scaled_delta);
+                break;
+            }
+        }
+    }
+
+    pub fn preempt_disable(&self) {
+        let _previous_count = self.preempt_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn preempt_enable(&self) {
+        let mut previous_count = self.preempt_count.load(Ordering::Relaxed);
+        // Debug fix: enabling preemption at zero must not underflow.
+        while previous_count != 0 {
+            match self.preempt_count.compare_exchange_weak(
+                previous_count,
+                previous_count - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(next_count) => previous_count = next_count,
+            }
+        }
+        if previous_count == 1 {
+            let _need_resched = self.queue.lock().unwrap().len() > 0;
+        }
+    }
+
+    pub fn preemptible(&self) -> bool {
+        self.preempt_count.load(Ordering::Relaxed) == 0
+    }
+
+    pub fn boost_priority(&self, task_id: usize, amount: i32) {
+        let mut queue = self.queue.lock().unwrap();
+        for (queued_id, policy) in queue.iter_mut() {
+            if *queued_id == task_id {
+                policy.prio = (policy.prio - amount).max(-20);
+                break;
+            }
+        }
+    }
+
+    pub fn yield_current(&self) -> bool {
+        let current_task = self.current.lock().unwrap().take();
+        match current_task {
+            Some(task_id) => {
+                let mut queue = self.queue.lock().unwrap();
+                let policy = SchedulePolicy::new();
+                queue.push((task_id, policy));
+                true
+            }
+            None => false,
+        }
+    }
 }
