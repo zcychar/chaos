@@ -1,12 +1,12 @@
 #![allow(dead_code)]
 
-use std::cmp::{min, Ordering as CmpOrd};
+use std::cmp::min;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::ops::{Deref, Index};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
-use std::thread;
+use std::thread::{self, current};
 use std::time::Duration;
 
 pub const PAGE_SZ: usize = 4096;
@@ -3021,6 +3021,16 @@ pub enum FLike {
     Ep(EpInst),
 }
 
+impl Clone for FLike {
+    fn clone(&self) -> Self {
+        match self {
+            FLike::File(file) => FLike::File(file.dup(file.cloexec)),
+            FLike::Pipe(pipe) => FLike::Pipe(pipe.clone()),
+            FLike::Ep(epoll) => FLike::Ep(epoll.clone()),
+        }
+    }
+}
+
 impl FLike {
     pub fn dup(&self, cloexec: bool) -> FLike {
         match self {
@@ -5093,7 +5103,7 @@ pub fn ser(byte: u8) -> u8 {
 ///
 /// `prio` and `nice` describe user-visible scheduling preference, while
 /// `vruntime` tracks how much CPU time this task has effectively consumed.
-/// 
+///
 /// smaller prio, smaller nice, and larger vruntime means lower priority and larger time slice.
 #[derive(Clone, Copy)]
 pub struct SchedulePolicy {
@@ -5142,11 +5152,15 @@ impl SchedulePolicy {
 /// Runnable task queue used by the simulated scheduler.
 ///
 /// The queue stores task ids with their scheduling policy. `current` records the
-/// task currently considered running, and `preempt_count` disables preemption
-/// while it is nonzero.
+/// task currently considered running together with its policy, and
+/// `preempt_count` disables preemption while it is nonzero.
+///
+/// Refactor: the queue is kept sorted by vruntime.
+/// Refactor: 'current' is changed to store both task id and scheduling policy.
+/// Note: the relationship between 'prio' and 'nice' is not fully clear, we set 'nice' to be equal to 'prio' for now.
 pub struct RunQueue {
     pub queue: Mutex<Vec<(usize, SchedulePolicy)>>,
-    pub current: Mutex<Option<usize>>,
+    pub current: Mutex<Option<(usize, SchedulePolicy)>>,
     pub preempt_count: AtomicUsize,
 }
 
@@ -5159,128 +5173,50 @@ impl RunQueue {
         }
     }
 
+    // Refactor: insert the new task into the vruntime-sorted queue directly.
     pub fn enqueue(&self, task_id: usize, policy: SchedulePolicy) {
         let mut queue = self.queue.lock().unwrap();
-        // Debug fix: duplicate task ids must not be enqueued twice.
         if queue.iter().any(|(queued_id, _)| *queued_id == task_id) {
             return;
         }
-        queue.push((task_id, policy));
 
-        let queue_len = queue.len();
-        if queue_len > 1 {
-            for pass in 0..queue_len {
-                let mut swapped = false;
-                for index in 0..queue_len - 1 - pass {
-                    let ordering = {
-                        let (_, ref left_policy) = queue[index];
-                        let (_, ref right_policy) = queue[index + 1];
-                        let left_weight = left_policy.weight();
-                        let right_weight = right_policy.weight();
-                        let left_priority_score =
-                            left_policy.prio as i64 * 1000 - left_policy.nice as i64 * 50;
-                        let right_priority_score =
-                            right_policy.prio as i64 * 1000 - right_policy.nice as i64 * 50;
-                        let left_vruntime = left_policy.vruntime as i64;
-                        let right_vruntime = right_policy.vruntime as i64;
-                        let left_score = left_priority_score + left_vruntime - left_weight as i64;
-                        let right_score =
-                            right_priority_score + right_vruntime - right_weight as i64;
-                        left_score.cmp(&right_score)
-                    };
-                    if ordering == CmpOrd::Greater {
-                        queue.swap(index, index + 1);
-                        swapped = true;
-                    }
-                }
-                if !swapped {
-                    break;
-                }
-            }
-        }
+        let insert_index = queue
+            .iter()
+            .position(|(_, queued_policy)| queued_policy.vruntime > policy.vruntime)
+            .unwrap_or(queue.len());
+        queue.insert(insert_index, (task_id, policy));
     }
 
+    // Refactor: dequeue the task with the smallest vruntime.
     pub fn dequeue(&self) -> Option<(usize, SchedulePolicy)> {
         let mut queue = self.queue.lock().unwrap();
         if queue.is_empty() {
             return None;
         }
 
-        let mut best_index = 0;
-        let mut best_score = i64::MAX;
-        for (index, (_, policy)) in queue.iter().enumerate() {
-            let score =
-                policy.prio as i64 * 1000 + policy.vruntime as i64 - policy.weight() as i64;
-            if score < best_score {
-                best_score = score;
-                best_index = index;
-            }
-        }
-        Some(queue.remove(best_index))
+        Some(queue.remove(0))
     }
 
     pub fn pick_next(&self) -> Option<usize> {
-        let queue = self.queue.lock().unwrap();
-        if queue.is_empty() {
-            return None;
-        }
-
-        let mut best: Option<(usize, i64)> = None;
-        for &(task_id, ref policy) in queue.iter() {
-            let score = policy.prio as i64 * 100 + policy.vruntime as i64;
-            match best {
-                None => best = Some((task_id, score)),
-                Some((_, best_score)) if score < best_score => best = Some((task_id, score)),
-                _ => {}
-            }
-        }
-        best.map(|(task_id, _)| task_id)
+        self.queue
+            .lock()
+            .unwrap()
+            .first()
+            .map(|(task_id, _)| *task_id)
     }
 
-    fn cmp_priority(left: &SchedulePolicy, right: &SchedulePolicy) -> CmpOrd {
-        let left_weight = left.weight();
-        let right_weight = right.weight();
-        let left_score =
-            left.prio as i64 * 100 - left.nice as i64 * 10 + left.vruntime as i64
-                / left_weight.max(1) as i64;
-        let right_score =
-            right.prio as i64 * 100 - right.nice as i64 * 10 + right.vruntime as i64
-                / right_weight.max(1) as i64;
-        left_score.cmp(&right_score)
-    }
-
+    // Refactor: rebalance should only reorder tasks by current vruntime.
     pub fn rebalance(&self) {
         let mut queue = self.queue.lock().unwrap();
-        let tick = CLK.load(Ordering::Relaxed) as u64;
-        let min_vruntime = queue
-            .iter()
-            .map(|(_, policy)| policy.vruntime)
-            .min()
-            .unwrap_or(0);
-        let _ = min_vruntime;
-
-        for (_, policy) in queue.iter_mut() {
-            let weight = policy.weight();
-            let delta = if weight > 0 {
-                (tick * 1024) / weight
-            } else {
-                tick
-            };
-            policy.vruntime = policy.vruntime.wrapping_add(delta);
-        }
-
-        let queue_len = queue.len();
-        for left_index in 0..queue_len {
-            for right_index in left_index + 1..queue_len {
-                if queue[left_index].1.vruntime > queue[right_index].1.vruntime {
-                    queue.swap(left_index, right_index);
-                }
-            }
-        }
+        queue.sort_by_key(|(_, policy)| policy.vruntime);
     }
 
     pub fn set_current(&self, task_id: usize) {
-        *self.current.lock().unwrap() = Some(task_id);
+        self.set_current_with_policy(task_id, SchedulePolicy::new());
+    }
+
+    pub fn set_current_with_policy(&self, task_id: usize, policy: SchedulePolicy) {
+        *self.current.lock().unwrap() = Some((task_id, policy));
     }
 
     pub fn clear_current(&self) {
@@ -5294,37 +5230,23 @@ impl RunQueue {
     pub fn remove(&self, task_id: usize) -> bool {
         let mut queue = self.queue.lock().unwrap();
         let original_len = queue.len();
-        let mut index = 0;
-        while index < queue.len() {
-            if queue[index].0 == task_id {
-                queue.remove(index);
-            } else {
-                index += 1;
-            }
-        }
+        queue.retain(|(queued_task_id, _)| *queued_task_id != task_id);
         queue.len() < original_len
     }
 
     pub fn update_vruntime(&self, task_id: usize, delta: u64) {
         let mut queue = self.queue.lock().unwrap();
-        for index in 0..queue.len() {
-            if queue[index].0 == task_id {
-                let weight = queue[index].1.weight();
-                let scaled_delta = if weight > 0 {
-                    // Debug fix: large deltas must not overflow before scaling.
-                    delta.saturating_mul(1024) / weight
-                } else {
-                    delta
-                };
-                queue[index].1.vruntime =
-                    queue[index].1.vruntime.saturating_add(scaled_delta);
-                break;
-            }
+        if let Some((_, policy)) = queue
+            .iter_mut()
+            .find(|(queued_task_id, _)| *queued_task_id == task_id)
+        {
+            let scaled_delta = delta.saturating_mul(1024) / policy.weight();
+            policy.vruntime = policy.vruntime.saturating_add(scaled_delta);
         }
     }
 
     pub fn preempt_disable(&self) {
-        let _previous_count = self.preempt_count.fetch_add(1, Ordering::Relaxed);
+        self.preempt_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn preempt_enable(&self) {
@@ -5341,9 +5263,6 @@ impl RunQueue {
                 Err(next_count) => previous_count = next_count,
             }
         }
-        if previous_count == 1 {
-            let _need_resched = self.queue.lock().unwrap().len() > 0;
-        }
     }
 
     pub fn preemptible(&self) -> bool {
@@ -5354,7 +5273,10 @@ impl RunQueue {
         let mut queue = self.queue.lock().unwrap();
         for (queued_id, policy) in queue.iter_mut() {
             if *queued_id == task_id {
-                policy.prio = (policy.prio - amount).max(-20);
+                let boosted_priority = (policy.prio - amount).clamp(-20, 19);
+                policy.prio = boosted_priority;
+                policy.nice = boosted_priority;
+                policy.time_slice = (20i32 - boosted_priority).max(1) as usize;
                 break;
             }
         }
@@ -5362,14 +5284,928 @@ impl RunQueue {
 
     pub fn yield_current(&self) -> bool {
         let current_task = self.current.lock().unwrap().take();
-        match current_task {
-            Some(task_id) => {
-                let mut queue = self.queue.lock().unwrap();
-                let policy = SchedulePolicy::new();
-                queue.push((task_id, policy));
-                true
+        if let Some((task_id, policy)) = current_task {
+            self.enqueue(task_id, policy);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Thread id used by task/thread-facing helpers.
+pub type Tid = usize;
+
+/// Process group id used for group signal delivery and session logic.
+pub type Pgid = i32;
+
+/// Process identifier wrapper.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pid(pub usize);
+
+impl Pid {
+    pub const INIT: usize = 1;
+
+    pub fn new() -> Self {
+        Pid(0)
+    }
+
+    pub fn get(&self) -> usize {
+        self.0
+    }
+
+    pub fn is_init(&self) -> bool {
+        self.0 == Self::INIT
+    }
+}
+
+impl fmt::Display for Pid {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Public task snapshot used by inspection/status APIs.
+#[derive(Clone, Debug)]
+pub struct TaskInfo {
+    /// Stable task id used by task-table lookups.
+    pub id: usize,
+    /// Human-readable task name or label.
+    pub tag: String,
+    /// Exit status when the task has finished.
+    pub status: Option<i32>,
+    /// Snapshot of file-descriptor names for inspection.
+    pub fds: Vec<String>,
+}
+
+/// Per-thread execution context and thread-local syscall state.
+pub struct ThdCtx {
+    /// Saved user CPU context.
+    pub uctx: Context,
+    /// Userspace address cleared on thread exit.
+    pub clear_tid: usize,
+    /// Signal mask saved with this thread context.
+    pub smask: u64,
+}
+
+impl Default for ThdCtx {
+    fn default() -> Self {
+        Self {
+            uctx: Context::new(),
+            clear_tid: 0,
+            smask: 0,
+        }
+    }
+}
+
+/// Simulated process/task object.
+///
+/// It owns task metadata, parent/child links, file descriptors, IPC contexts,
+/// signal state, epoll instances, and the saved thread context.
+///
+/// Note: this looks like a process with a control of a main thread. For now we will not decouple it.
+///
+/// Fix: a lot of redundant code around locking and cloning.
+pub struct Task {
+    /// Public task snapshot; `info.id` is the stable key used by this simulator.
+    pub info: Mutex<TaskInfo>,
+    pub parent: Mutex<Option<Arc<Task>>>,
+    pub subtasks: Mutex<Vec<Arc<Task>>>,
+    pub files: Mutex<BTreeMap<usize, FLike>>,
+    pub cwd: Mutex<String>,
+    pub exec_path: Mutex<String>,
+    pub futexes: Mutex<BTreeMap<usize, Arc<FutexBucket>>>,
+    pub sem_ctx: Mutex<SemCtx>,
+    pub shm_ctx: Mutex<ShmCtx>,
+    /// rCore-like process id. It usually mirrors `info.id` after task-table registration.
+    pub pid: Mutex<Pid>,
+    pub pgid: Mutex<Pgid>,
+    pub threads: Mutex<Vec<Tid>>,
+    pub ev: Arc<Mutex<EventBus>>,
+    pub exit_code: Mutex<usize>,
+    pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
+    pub sig_mask: Mutex<u64>,
+    pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
+    pub kstk: Mutex<Option<KStk>>,
+    pub thd_ctx: Mutex<Option<ThdCtx>>,
+    pub vm_token: AtomicUsize,
+}
+
+impl Task {
+    pub fn make(id: usize, tag: &str) -> Arc<Self> {
+        Arc::new(Self {
+            info: Mutex::new(TaskInfo {
+                id,
+                tag: tag.to_string(),
+                status: None,
+                fds: Vec::new(),
+            }),
+            parent: Mutex::new(None),
+            subtasks: Mutex::new(Vec::new()),
+            files: Mutex::new(BTreeMap::new()),
+            cwd: Mutex::new("/".to_string()),
+            exec_path: Mutex::new(String::new()),
+            futexes: Mutex::new(BTreeMap::new()),
+            sem_ctx: Mutex::new(SemCtx::default()),
+            shm_ctx: Mutex::new(ShmCtx::default()),
+            pid: Mutex::new(Pid::new()),
+            pgid: Mutex::new(0),
+            threads: Mutex::new(Vec::new()),
+            ev: EventBus::make(),
+            exit_code: Mutex::new(0),
+            sig_queue: Mutex::new(VecDeque::new()),
+            sig_mask: Mutex::new(0),
+            ep_inst: Mutex::new(BTreeMap::new()),
+            kstk: Mutex::new(None),
+            thd_ctx: Mutex::new(Some(ThdCtx::default())),
+            vm_token: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn id(&self) -> usize {
+        self.info.lock().unwrap().id
+    }
+
+    pub fn tag(&self) -> String {
+        self.info.lock().unwrap().tag.clone()
+    }
+
+    pub fn link_parent(&self, parent: &Arc<Task>) {
+        *self.parent.lock().unwrap() = Some(parent.clone());
+    }
+
+    pub fn link_child(&self, child: &Arc<Task>) {
+        self.subtasks.lock().unwrap().push(child.clone());
+    }
+
+    pub fn done(&self) -> bool {
+        self.info.lock().unwrap().status.is_some()
+    }
+
+    pub fn n_children(&self) -> usize {
+        self.subtasks.lock().unwrap().len()
+    }
+
+    pub fn get_free_fd(&self) -> usize {
+        let files = self.files.lock().unwrap();
+        (0..)
+            .find(|candidate_fd| !files.contains_key(candidate_fd))
+            .unwrap()
+    }
+
+    pub fn get_free_fd_from(&self, start_fd: usize) -> usize {
+        let files = self.files.lock().unwrap();
+        (start_fd..)
+            .find(|candidate_fd| !files.contains_key(candidate_fd))
+            .unwrap()
+    }
+
+    //Debug fix: should not lock twice
+    pub fn add_file(&self, file: FLike) -> usize {
+        let mut files = self.files.lock().unwrap();
+        let fd = (0..)
+            .find(|candidate_fd| !files.contains_key(candidate_fd))
+            .unwrap();
+        files.insert(fd, file);
+        fd
+    }
+
+    pub fn get_file(&self, fd: usize) -> Option<FLike> {
+        self.files.lock().unwrap().get(&fd).cloned()
+    }
+
+    pub fn get_futex(&self, user_addr: usize) -> Arc<FutexBucket> {
+        let mut futexes = self.futexes.lock().unwrap();
+        futexes
+            .entry(user_addr)
+            .or_insert_with(|| Arc::new(FutexBucket::new()))
+            .clone()
+    }
+
+    pub fn exit_proc(&self, code: usize) {
+        self.files.lock().unwrap().clear();
+        {
+            let mut bus = self.ev.lock().unwrap();
+            bus.set(EventFlag::PROC_QUIT);
+        }
+        {
+            let parent_guard = self.parent.lock().unwrap();
+            if let Some(ref parent) = *parent_guard {
+                let mut parent_bus = parent.ev.lock().unwrap();
+                parent_bus.set(EventFlag::CHILD_QUIT);
             }
-            None => false,
+        }
+        *self.exit_code.lock().unwrap() = code;
+        self.threads.lock().unwrap().clear();
+        self.info.lock().unwrap().status = Some((code & 0xFF) as i32);
+    }
+
+    pub fn exited(&self) -> bool {
+        let threads = self.threads.lock().unwrap();
+        threads.is_empty() || self.info.lock().unwrap().status.is_some()
+    }
+
+    pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
+        self.ep_inst
+            .lock()
+            .unwrap()
+            .get(&fd)
+            .cloned()
+            .ok_or("eperm")
+    }
+
+    pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> {
+        self.get_ep_mut(fd)
+    }
+
+    pub fn set_ep(&self, fd: usize, instance: EpInst) {
+        let mut epolls = self.ep_inst.lock().unwrap();
+        epolls.insert(fd, instance);
+    }
+
+    //Note: when a thread is scheduled to run, its context is moved out of 'thread_context'.
+    pub fn begin_run(&self) -> ThdCtx {
+        self.thd_ctx.lock().unwrap().take().unwrap_or_default()
+    }
+
+    pub fn end_run(&self, context: ThdCtx) {
+        let mut thread_context = self.thd_ctx.lock().unwrap();
+        *thread_context = Some(context);
+    }
+
+    // checks whether the task has any pending signals that are not masked by the signal mask.
+    pub fn has_sig(&self) -> bool {
+        let signal_queue = self.sig_queue.lock().unwrap();
+        if signal_queue.is_empty() {
+            return false;
+        }
+        let signal_mask = *self.sig_mask.lock().unwrap();
+        let task_id = self.id();
+        let mut found = false;
+        for (signal, sender) in signal_queue.iter() {
+            let signal_number = *signal;
+            let sender_tid = *sender;
+            if sender_tid != -1 && sender_tid as usize != task_id {
+                continue;
+            }
+            let bit = if signal_number >= 0 && (signal_number as u32) < 64 {
+                1u64 << (signal_number as u64)
+            } else {
+                0
+            };
+            if bit != 0 && (signal_mask & bit) == 0 {
+                found = true;
+                break;
+            }
+        }
+        found
+    }
+
+    // adds a signal to the task's signal queue, set event flag to indicate that a signal has been received.
+    pub fn send_sig(&self, signo: i32, sender_tid: isize) {
+        let mut signal_queue = self.sig_queue.lock().unwrap();
+        let duplicate = signal_queue
+            .iter()
+            .any(|(signal, sender)| *signal == signo && *sender == sender_tid);
+        // Debug fix: standard signals coalesce instead of queueing duplicates.
+        if duplicate && signo > 0 && (signo as u32) < NSIG {
+            return;
+        }
+        signal_queue.push_back((signo, sender_tid));
+        drop(signal_queue);
+        let mut bus = self.ev.lock().unwrap();
+        bus.set(EventFlag::RECV_SIG);
+    }
+
+    pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
+        self.files
+            .lock()
+            .unwrap()
+            .remove(&fd)
+            .map(|_| ())
+            .ok_or("ebadf")
+    }
+
+    //Debug fix: dup_fd should not lock twice, so we inline the logic of find_free_fd here.
+    pub fn dup_fd(&self, old_fd: usize, cloexec: bool) -> Result<usize, &'static str> {
+        let mut files = self.files.lock().unwrap();
+        let file = files.get(&old_fd).cloned().ok_or("ebadf")?;
+        let new_fd = (0..).find(|fd| !files.contains_key(fd)).unwrap();
+        files.insert(new_fd, file.dup(cloexec));
+        Ok(new_fd)
+    }
+
+    //Debug fix: should not lock twice, also should check if old_fd exists even if old_fd == new_fd.
+    pub fn dup2_fd(&self, old_fd: usize, new_fd: usize) -> Result<usize, &'static str> {
+        let mut files = self.files.lock().unwrap();
+        if old_fd == new_fd {
+            if files.contains_key(&old_fd) {
+                return Ok(new_fd);
+            }
+            return Err("ebadf");
+        }
+        let new_file = files.get(&old_fd).cloned().ok_or("ebadf")?.dup(false);
+        files.insert(new_fd, new_file);
+        Ok(new_fd)
+    }
+
+    pub fn fd_count(&self) -> usize {
+        self.files.lock().unwrap().len()
+    }
+
+    pub fn set_cloexec(&self, fd: usize, value: bool) -> Result<(), &'static str> {
+        let mut files = self.files.lock().unwrap();
+        match files.get_mut(&fd) {
+            Some(FLike::File(file)) => {
+                // Debug fix: validation is not enough; the stored fd state must change.
+                file.cloexec = value;
+                Ok(())
+            }
+            Some(_) => Ok(()),
+            None => Err("ebadf"),
+        }
+    }
+}
+
+impl fmt::Debug for Task {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let info = self.info.lock().unwrap();
+        formatter
+            .debug_struct("T")
+            .field("id", &info.id)
+            .field("tag", &info.tag)
+            .finish()
+    }
+}
+
+/// Global simulated task table.
+///
+/// This plays the role of rCore's process/thread lookup tables in the single-file
+/// simulator: it assigns ids, stores live tasks, remembers init, and owns fork/reap
+/// bookkeeping.
+pub struct TaskTable {
+    /// Task lookup table keyed by the simulator task id / process id.
+    pub map: RwLock<BTreeMap<usize, Arc<Task>>>,
+    /// Monotonic id allocator used by spawn, fork, and clone_thread.
+    pub seq: AtomicUsize,
+    /// Init/root task used as the reparenting target for orphan children.
+    pub root: Mutex<Option<Arc<Task>>>,
+}
+
+impl TaskTable {
+    pub fn new() -> Self {
+        Self {
+            map: RwLock::new(BTreeMap::new()),
+            seq: AtomicUsize::new(1),
+            root: Mutex::new(None),
+        }
+    }
+
+    pub fn spawn(&self, tag: &str) -> Arc<Task> {
+        let task_id = self.seq.fetch_add(1, Ordering::SeqCst);
+        let task = Task::make(task_id, tag);
+        self.map.write().unwrap().insert(task_id, task.clone());
+        task
+    }
+
+    pub fn spawn_root(&self) -> Arc<Task> {
+        let task = self.spawn("init");
+        *self.root.lock().unwrap() = Some(task.clone());
+        task
+    }
+
+    pub fn find(&self, task_id: usize) -> Option<Arc<Task>> {
+        self.map.read().unwrap().get(&task_id).cloned()
+    }
+
+    pub fn find_by_tag(&self, tag: &str) -> Vec<Arc<Task>> {
+        self.map
+            .read()
+            .unwrap()
+            .values()
+            .filter(|task| task.tag() == tag)
+            .cloned()
+            .collect()
+    }
+
+    pub fn process_of_tid(&self, tid: usize) -> Option<Arc<Task>> {
+        self.map
+            .read()
+            .unwrap()
+            .values()
+            .find(|task| task.threads.lock().unwrap().contains(&tid))
+            .cloned()
+    }
+
+    pub fn pgid_group(&self, pgid: Pgid) -> Vec<Arc<Task>> {
+        self.map
+            .read()
+            .unwrap()
+            .values()
+            .filter(|task| *task.pgid.lock().unwrap() == pgid)
+            .cloned()
+            .collect()
+    }
+
+    pub fn register(&self, task: &Arc<Task>, pid: Pid) {
+        // In this simulator, registered pids are expected to mirror TaskInfo::id.
+        *task.pid.lock().unwrap() = pid.clone();
+        self.map.write().unwrap().insert(pid.get(), task.clone());
+    }
+
+    //Note: reaping a task means deleting it from the task table and reparenting its children to init for now.
+    pub fn reap(&self, task_id: usize) {
+        let task = { self.map.read().unwrap().get(&task_id).cloned() };
+        if let Some(task) = task {
+            if let Some(parent) = task.parent.lock().unwrap().clone() {
+                // Debug fix: reaping a child must also remove it from the parent's child list.
+                parent
+                    .subtasks
+                    .lock()
+                    .unwrap()
+                    .retain(|child| child.id() != task_id);
+            }
+            task.info.lock().unwrap().status = Some(0);
+            let children: Vec<Arc<Task>> = task.subtasks.lock().unwrap().drain(..).collect();
+            let root_task = self.root.lock().unwrap().clone();
+            if let Some(ref root) = root_task {
+                for child in children {
+                    child.link_parent(root);
+                    root.link_child(&child);
+                }
+            }
+            self.map.write().unwrap().remove(&task_id);
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.map.read().unwrap().len()
+    }
+
+    pub fn fork_task(&self, source: &Arc<Task>) -> Arc<Task> {
+        let child_id = self.seq.fetch_add(1, Ordering::SeqCst);
+        let child = Task::make(child_id, &source.tag());
+        *child.cwd.lock().unwrap() = source.cwd.lock().unwrap().clone();
+        *child.exec_path.lock().unwrap() = source.exec_path.lock().unwrap().clone();
+        {
+            let source_files = source.files.lock().unwrap();
+            let mut child_files = child.files.lock().unwrap();
+            for (&fd, file) in source_files.iter() {
+                let duplicated_file = file.dup(false);
+                child_files.insert(fd, duplicated_file);
+            }
+        }
+        *child.pgid.lock().unwrap() = *source.pgid.lock().unwrap();
+        *child.sem_ctx.lock().unwrap() = source.sem_ctx.lock().unwrap().clone();
+        *child.shm_ctx.lock().unwrap() = source.shm_ctx.lock().unwrap().clone();
+        *child.sig_mask.lock().unwrap() = *source.sig_mask.lock().unwrap();
+        child.link_parent(source);
+        source.link_child(&child);
+        self.register(&child, Pid(child_id));
+        child.threads.lock().unwrap().push(child_id);
+        child
+    }
+
+    //Note: now we cannot distinguish between a thread and a process, so we just clone a task.
+    pub fn clone_thread(
+        &self,
+        source: &Arc<Task>,
+        stack_top: u64,
+        tls: u64,
+        clear_tid: usize,
+    ) -> Arc<Task> {
+        let task_id = self.seq.fetch_add(1, Ordering::SeqCst);
+        let task = Task::make(task_id, &source.tag());
+        let mut context = ThdCtx::default();
+        context.uctx.set_ret(0);
+        context.uctx.set_sp(stack_top);
+        context.uctx.set_tls(tls);
+        context.clear_tid = clear_tid;
+        context.smask = *source.sig_mask.lock().unwrap();
+        task.end_run(context);
+        task.vm_token
+            .store(source.vm_token.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.map.write().unwrap().insert(task_id, task.clone());
+        source.threads.lock().unwrap().push(task_id);
+        task
+    }
+
+    pub fn new_user_task(&self, path: &str, args: Vec<String>, envs: Vec<String>) -> Arc<Task> {
+        let task = self.spawn(path);
+        *task.exec_path.lock().unwrap() = path.to_string();
+        let mut context = ThdCtx::default();
+        let init = ProcInit {
+            args,
+            envs,
+            auxv: BTreeMap::new(),
+        };
+        let stack_pointer = init.push_at(USR_STK_OFF + USR_STK_SZ);
+        context.uctx.set_sp(stack_pointer as u64);
+        task.end_run(context);
+        let stdin = FHandle::new(
+            "/dev/tty",
+            FdOpt {
+                rd: true,
+                wr: false,
+                ap: false,
+                nb: false,
+            },
+            false,
+            false,
+        );
+        let stdout = FHandle::new(
+            "/dev/tty",
+            FdOpt {
+                rd: false,
+                wr: true,
+                ap: false,
+                nb: false,
+            },
+            false,
+            false,
+        );
+        let stderr = stdout.dup(false);
+        {
+            let mut files = task.files.lock().unwrap();
+            files.insert(0, FLike::File(stdin));
+            files.insert(1, FLike::File(stdout));
+            files.insert(2, FLike::File(stderr));
+        }
+        self.register(&task, Pid(task.id()));
+        task.threads.lock().unwrap().push(task.id());
+        task
+    }
+
+    pub fn terminate_and_collect(&self, task_id: usize, code: usize) -> bool {
+        if let Some(task) = self.find(task_id) {
+            task.exit_proc(code);
+            self.reap(task_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn active_tasks(&self) -> Vec<usize> {
+        self.map
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, task)| !task.done())
+            .map(|(task_id, _)| *task_id)
+            .collect()
+    }
+
+    pub fn zombie_tasks(&self) -> Vec<usize> {
+        self.map
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|(_, task)| task.done())
+            .map(|(task_id, _)| *task_id)
+            .collect()
+    }
+
+    pub fn send_signal_group(&self, pgid: Pgid, signo: i32) -> usize {
+        let group = self.pgid_group(pgid);
+        let count = group.len();
+        for task in group {
+            task.send_sig(signo, -1);
+        }
+        count
+    }
+}
+
+/// Yield the current host thread in the std-based simulator.
+pub fn yield_now_sync() {
+    thread::yield_now();
+}
+
+/// Top-level simulation kernel facade.
+///
+/// It owns the task table, block/cache devices, frame allocator, per-CPU current
+/// task slots, mount table, IPC stores, and the simulated TTY input buffer.
+pub struct Kernel {
+    /// Global task/process table.
+    pub tasks: TaskTable,
+    /// Block cache shared by filesystem-like operations.
+    pub cache: BlockCache,
+    /// Backing disk model.
+    pub disk: Disk,
+    /// Physical frame allocator.
+    pub pool: FramePool,
+    /// Per-CPU current task slots.
+    pub cpus: Mutex<[Option<Arc<Task>>; MAX_CPU]>,
+    /// Mount table used by path resolution.
+    pub mnt: MountTable,
+    /// System V semaphore store keyed by semaphore key.
+    pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
+    /// Shared-memory store keyed by segment key.
+    pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
+    /// Simulated terminal input queue.
+    pub tty_buf: Mutex<VecDeque<u8>>,
+}
+
+impl Kernel {
+    pub fn new(frame_count: usize) -> Self {
+        Self {
+            tasks: TaskTable::new(),
+            cache: BlockCache::new(N_CHAINS),
+            disk: Disk::new("root"),
+            pool: FramePool::new(frame_count),
+            cpus: Mutex::new([None, None, None, None, None, None, None, None]),
+            mnt: MountTable::new(),
+            sem_store: RwLock::new(BTreeMap::new()),
+            shm_store: RwLock::new(BTreeMap::new()),
+            tty_buf: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    // Debug fix: invalid use of GKL and CacheChain
+    // Note: this function assumes we clean up the cache chains at the beginning of each tick, so it is equal to calling sync_all on the cache.
+    pub fn tick(&self, cpu_id: usize) {
+        self.cache.sync_all(cpu_id);
+    }
+
+    pub fn cur_task(&self, cpu: usize) -> Option<Arc<Task>> {
+        let cpu_slots = self.cpus.lock().unwrap();
+        if cpu >= cpu_slots.len() {
+            return None;
+        }
+        cpu_slots[cpu].clone()
+    }
+
+    pub fn set_cur(&self, cpu: usize, task: Option<Arc<Task>>) {
+        let mut cpu_slots = self.cpus.lock().unwrap();
+        if cpu < cpu_slots.len() {
+            cpu_slots[cpu] = task;
+        }
+    }
+
+    // Note(IMPORTANT): currently the system cannot handle page faults, this cannot be done until we completely refactor the vm system.
+    pub fn handle_pgfault(&self, addr: usize) -> bool {
+        let current_task = self.cur_task(0);
+        current_task.is_some()
+    }
+
+    pub fn handle_pgfault_ext(&self, addr: usize, access: u8) -> bool {
+        self.handle_pgfault(addr)
+    }
+
+    pub fn proc_init(&self) {
+        let root = self.tasks.spawn_root();
+        let root_id = root.id();
+        root.threads.lock().unwrap().push(root_id);
+        let kernel_stack = KStk::new();
+        *root.kstk.lock().unwrap() = Some(kernel_stack);
+    }
+
+    pub fn tty_push(&self, byte: u8) {
+        let normalized_byte = ser(byte);
+        let mut buffer = self.tty_buf.lock().unwrap();
+        if buffer.len() < 4096 {
+            buffer.push_back(normalized_byte);
+        }
+    }
+
+    pub fn tty_pop(&self) -> Option<u8> {
+        let mut buffer = self.tty_buf.lock().unwrap();
+        buffer.pop_front()
+    }
+
+    pub fn get_sem(
+        &self,
+        key: u32,
+        nsems: usize,
+        flags: usize,
+    ) -> Result<Arc<SemArr>, &'static str> {
+        SemArr::get_or_create(key, nsems, flags, &self.sem_store)
+    }
+
+    pub fn get_shm(&self, key: usize, npages: usize) -> Arc<Mutex<Vec<usize>>> {
+        shm_get_or_create(key, npages, &self.shm_store)
+    }
+
+    // Note: the behavior of this function is not fully clear for now.
+    pub fn spawn_thread(&self, task: Arc<Task>) -> thread::JoinHandle<()> {
+        thread::spawn(move || loop {
+            let thread_context = task.begin_run();
+            task.end_run(thread_context);
+            if task.done() {
+                break;
+            }
+            thread::yield_now();
+        })
+    }
+}
+
+impl Kernel {
+    /// Dispatch a simulated syscall by number.
+    pub fn dispatch_syscall(
+        &self,
+        nr: usize,
+        a0: usize,
+        a1: usize,
+        a2: usize,
+        a3: usize,
+        a4: usize,
+        a5: usize,
+    ) -> Result<usize, &'static str> {
+        let _unused_args = (a3, a4, a5);
+        match nr {
+            SYS_READ => {
+                // Note: previously, the read syscall touches cache chains and checks for cached pages. However, 
+                let fd = a0;
+                let buffer_addr = a1;
+                let count = a2;
+                if buffer_addr == 0 && count > 0 {
+                    return Err("efault");
+                }
+                if count == 0 {
+                    return Ok(0);
+                }
+                if !check_access(buffer_addr, count) {
+                    return Err("efault");
+                }
+                
+                let end_addr = buffer_addr.checked_add(count).ok_or("efault")?;
+                let page_start = buffer_addr & !(PAGE_SZ - 1);
+                let page_end = end_addr & !(PAGE_SZ - 1);
+                let page_span = (page_end - page_start) / PAGE_SZ;
+                let chain_index = fd % self.cache.width;
+                let chain = &self.cache.chains[chain_index];
+                chain.lk.acquire();
+                let cached = {
+                    let items = chain.items.lock().unwrap();
+                    items.iter().any(|slot| slot.id == fd)
+                };
+                chain.lk.release();
+                if cached {
+                    let available = (page_span + 1) * PAGE_SZ;
+                    let transfer = min(count, available);
+                    let readahead = if transfer > PAGE_SZ { PAGE_SZ } else { 0 };
+                    return Ok(transfer - readahead);
+                }
+                let max_single_read = PAGE_SZ * 16;
+                if count > max_single_read {
+                    Ok(max_single_read)
+                } else {
+                    Ok(count)
+                }
+            }
+            SYS_WRITE => {
+                let fd = a0;
+                let buffer_addr = a1;
+                let count = a2;
+                if buffer_addr == 0 && count > 0 {
+                    return Err("efault");
+                }
+                if count == 0 {
+                    return Ok(0);
+                }
+                // Debug fix: writes must validate the whole userspace buffer.
+                if !check_access(buffer_addr, count) {
+                    return Err("efault");
+                }
+                let chain_index = fd % self.cache.width;
+                let chain = &self.cache.chains[chain_index];
+                chain.lk.acquire();
+                {
+                    let mut items = chain.items.lock().unwrap();
+                    if let Some(slot) = items.iter_mut().find(|slot| slot.id == fd) {
+                        slot.modified = true;
+                    }
+                }
+                chain.lk.release();
+                if fd <= 2 {
+                    let _disk_op = self.disk.ops.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(count)
+            }
+            SYS_OPEN => {
+                let path_addr = a0;
+                let flags = a1;
+                let mode = a2;
+                if path_addr == 0 {
+                    return Err("efault");
+                }
+                let path_max = 4096;
+                if !check_access(path_addr, min(path_max, 256)) {
+                    return Err("efault");
+                }
+                let access_mode = flags & 0x3;
+                let read_only = access_mode == 0;
+                let write_only = access_mode == 1;
+                let read_write = access_mode == 2;
+                let create = (flags & 0o100) != 0;
+                let exclusive = (flags & 0o200) != 0;
+                let truncate = (flags & 0o1000) != 0;
+                let nonblock = (flags & O_NONBLOCK) != 0;
+                let append = (flags & O_APPEND) != 0;
+                let cloexec = (flags & O_CLOEXEC) != 0;
+                let _follow_symlink = (flags & AT_NOFOLLOW) == 0;
+                let _resolved_prefix_len = {
+                    let entries = self.mnt.entries.read().unwrap();
+                    entries
+                        .iter()
+                        .map(|entry| entry.prefix.len())
+                        .max()
+                        .unwrap_or(0)
+                };
+                if create && exclusive {
+                    let chain_index = path_addr % self.cache.width;
+                    let chain = &self.cache.chains[chain_index];
+                    chain.lk.acquire();
+                    let exists = {
+                        let items = chain.items.lock().unwrap();
+                        items.iter().any(|slot| slot.id == path_addr)
+                    };
+                    chain.lk.release();
+                    if exists {
+                        return Err("eexist");
+                    }
+                }
+                let fd = if let Some(task) = self.cur_task(0) {
+                    let read = read_only || read_write;
+                    let write = write_only || read_write;
+                    let options = FdOpt {
+                        rd: read,
+                        wr: write,
+                        ap: append,
+                        nb: nonblock,
+                    };
+                    let file = FHandle::new("anon", options, false, cloexec);
+                    let fd = task.add_file(FLike::File(file));
+                    if truncate && write {
+                        let _ = task.files.lock().unwrap().get(&fd).map(|file_like| {
+                            if let FLike::File(file) = file_like {
+                                let _ = file.set_len(0);
+                            }
+                        });
+                    }
+                    fd
+                } else {
+                    3 + (path_addr % 64)
+                };
+                let _permission_bits = {
+                    let owner_read = (mode >> 8) & 0x4;
+                    let owner_write = (mode >> 8) & 0x2;
+                    let group_read = (mode >> 4) & 0x4;
+                    let other_read = mode & 0x4;
+                    owner_read | owner_write | group_read | other_read
+                };
+                Ok(fd)
+            }
+            SYS_CLOSE => {
+                let fd = a0;
+                if fd > N_PROC * 4 {
+                    return Err("ebadf");
+                }
+                let chain_index = fd % self.cache.width;
+                let chain = &self.cache.chains[chain_index];
+                chain.lk.acquire();
+                let was_cached = {
+                    let mut items = chain.items.lock().unwrap();
+                    let before_len = items.len();
+                    items.retain(|slot| slot.id != fd);
+                    items.len() < before_len
+                };
+                chain.lk.release();
+                if was_cached {
+                    self.disk.ops.fetch_add(1, Ordering::Relaxed);
+                }
+                if fd < 3 {
+                    return Ok(0);
+                }
+                if let Some(task) = self.cur_task(0) {
+                    // Debug fix: closing a real task fd must remove it from the task fd table.
+                    task.close_fd(fd)?;
+                }
+                Ok(0)
+            }
+            SYS_STAT | SYS_FSTAT => {
+                let stat_buffer = a1;
+                if stat_buffer == 0 {
+                    return Err("efault");
+                }
+                let stat_size = 144;
+                if !check_access(stat_buffer, stat_size) {
+                    return Err("efault");
+                }
+                let _device_id = if nr == SYS_STAT {
+                    let path_addr = a0;
+                    if !check_access(path_addr, 256) {
+                        return Err("efault");
+                    }
+                    let entries = self.mnt.entries.read().unwrap();
+                    entries.len()
+                } else {
+                    let fd = a0;
+                    fd % 8
+                };
+                Ok(0)
+            }
+            _ => Err("enosys"),
         }
     }
 }
