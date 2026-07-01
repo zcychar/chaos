@@ -7353,9 +7353,9 @@ impl AddrSpace {
 }
 
 /// Simulated Unix process group.
-/// 
+///
 /// Note: its confusing that this struct is standalone and not the part of the Task struct, the only way of accessing is through 'broadcast_signal'.
-/// 
+///
 /// Session is a collection of process groups.
 pub struct ProcessGroup {
     pub pgid: Pgid,
@@ -7422,6 +7422,507 @@ impl ProcessGroup {
                 }
                 None => {}
             }
+        }
+    }
+}
+
+/// Simulated wait queue keyed by an address or object id. This looks like the implementation of futex wait queues.
+/// but we already have a futex waitqueue.
+///
+/// It parks host threads and wakes waiters by matching `key`;
+pub struct WaitQueue {
+    pub inner: Mutex<VecDeque<(usize, thread::Thread, u32)>>,
+    pub wake_count: AtomicUsize,
+}
+
+impl WaitQueue {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(VecDeque::new()),
+            wake_count: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn sleep(&self, key: usize, flags: u32) {
+        let mut queue = self.inner.lock().unwrap();
+        queue.push_back((key, thread::current(), flags));
+        drop(queue);
+        thread::park();
+    }
+
+    pub fn sleep_timeout(&self, key: usize, flags: u32, timeout: Duration) -> bool {
+        let current_thread = thread::current();
+        let current_thread_id = current_thread.id();
+        let mut queue = self.inner.lock().unwrap();
+        queue.push_back((key, current_thread, flags));
+        drop(queue);
+        thread::park_timeout(timeout);
+        let mut queue = self.inner.lock().unwrap();
+        let waiter_index = queue
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (wait_key, waiter_thread, waiter_flags))| {
+                *wait_key == key
+                    && waiter_thread.id() == current_thread_id
+                    && *waiter_flags == flags
+            })
+            .map(|(index, _)| index);
+        if let Some(waiter_index) = waiter_index {
+            queue.remove(waiter_index);
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn wake_one(&self, key: usize) -> bool {
+        let mut queue = self.inner.lock().unwrap();
+        if let Some(waiter_index) = queue.iter().position(|(wait_key, _, _)| *wait_key == key) {
+            let (_, waiter_thread, _) = queue.remove(waiter_index).unwrap();
+            waiter_thread.unpark();
+            self.wake_count.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    // Refactor: can be implemented by wake_filtered.
+    pub fn wake_all(&self, key: usize) -> usize {
+        self.wake_filtered(|wait_key, _| wait_key == key)
+    }
+
+    pub fn wake_filtered(&self, predicate: impl Fn(usize, u32) -> bool) -> usize {
+        let mut queue = self.inner.lock().unwrap();
+        let mut woken_count = 0;
+        let mut remaining_waiters = VecDeque::new();
+        for waiter_entry in queue.drain(..) {
+            if predicate(waiter_entry.0, waiter_entry.2) {
+                waiter_entry.1.unpark();
+                woken_count += 1;
+            } else {
+                remaining_waiters.push_back(waiter_entry);
+            }
+        }
+        *queue = remaining_waiters;
+        self.wake_count.fetch_add(woken_count, Ordering::Relaxed);
+        woken_count
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.inner.lock().unwrap().len()
+    }
+
+    pub fn total_wakes(&self) -> usize {
+        self.wake_count.load(Ordering::Relaxed)
+    }
+
+    pub fn has_waiters_for(&self, key: usize) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(wait_key, _, _)| *wait_key == key)
+    }
+
+    // Note: this function takes the third element of the tuple as priority, however, it should be flags.
+    pub fn reorder_by_priority(&self) {
+        let mut queue = self.inner.lock().unwrap();
+        queue
+            .make_contiguous()
+            .sort_by(|left_waiter, right_waiter| left_waiter.2.cmp(&right_waiter.2));
+    }
+}
+
+/// Simulated per-process resource limits.
+///
+/// This stores a small subset of Unix-style resource ceilings.
+pub struct ResourceLimits {
+    pub max_fds: usize,
+    pub max_threads: usize,
+    pub max_stack_size: usize,
+    pub max_data_size: usize,
+    pub max_file_size: usize,
+    pub max_mappings: usize,
+    pub cpu_time_limit: usize,
+}
+
+impl ResourceLimits {
+    pub fn default_limits() -> Self {
+        Self {
+            max_fds: 1024,
+            max_threads: 256,
+            max_stack_size: USR_STK_SZ * 4,
+            max_data_size: KHEAP_SZ,
+            max_file_size: usize::MAX,
+            max_mappings: 65536,
+            cpu_time_limit: 0,
+        }
+    }
+
+    pub fn check_fd(&self, current: usize) -> bool {
+        current < self.max_fds
+    }
+    pub fn check_threads(&self, current: usize) -> bool {
+        current < self.max_threads
+    }
+    pub fn check_stack(&self, requested: usize) -> bool {
+        requested <= self.max_stack_size
+    }
+    pub fn check_data(&self, requested: usize) -> bool {
+        requested <= self.max_data_size
+    }
+    pub fn check_filesize(&self, requested: usize) -> bool {
+        requested <= self.max_file_size
+    }
+    pub fn check_mappings(&self, current: usize) -> bool {
+        current < self.max_mappings
+    }
+
+    pub fn inherit(&self) -> Self {
+        Self {
+            max_fds: self.max_fds,
+            max_threads: self.max_threads,
+            max_stack_size: self.max_stack_size,
+            max_data_size: self.max_data_size,
+            max_file_size: self.max_file_size,
+            max_mappings: self.max_mappings,
+            cpu_time_limit: self.cpu_time_limit,
+        }
+    }
+
+    // Note: corresponds to RLIMIT_CPU/FSIZE/DATA/STACK/NOFILE
+    pub fn set_limit(&mut self, resource: usize, value: usize) -> Result<(), &'static str> {
+        match resource {
+            0 => {
+                self.cpu_time_limit = value;
+                Ok(())
+            }
+            1 => {
+                self.max_file_size = value;
+                Ok(())
+            }
+            2 => {
+                self.max_data_size = value;
+                Ok(())
+            }
+            3 => {
+                self.max_stack_size = value;
+                Ok(())
+            }
+            7 => {
+                self.max_fds = value;
+                Ok(())
+            }
+            _ => Err("einval"),
+        }
+    }
+
+    pub fn get_limit(&self, resource: usize) -> Result<usize, &'static str> {
+        match resource {
+            0 => Ok(self.cpu_time_limit),
+            1 => Ok(self.max_file_size),
+            2 => Ok(self.max_data_size),
+            3 => Ok(self.max_stack_size),
+            7 => Ok(self.max_fds),
+            _ => Err("einval"),
+        }
+    }
+
+    pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool {
+        let mut violations = 0usize;
+        if fds >= self.max_fds {
+            violations += 1;
+        }
+        if threads >= self.max_threads {
+            violations += 1;
+        }
+        if stack > self.max_stack_size {
+            violations += 1;
+        }
+        violations > 0
+    }
+}
+
+pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 {
+    (a & !mask) | (b & mask)
+}
+
+pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
+    if width == 0 || width > 64 {
+        return value;
+    }
+    let actual = amount % width;
+    if actual == 0 {
+        return value;
+    }
+    let mask = if width == 64 {
+        !0u64
+    } else {
+        (1u64 << width) - 1
+    };
+    let v = value & mask;
+    ((v << actual) | (v >> (width - actual))) & mask
+}
+
+pub fn popcount64(mut v: u64) -> u32 {
+    v = v - ((v >> 1) & 0x5555555555555555);
+    v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);
+    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F;
+    ((v.wrapping_mul(0x0101010101010101)) >> 56) as u32
+}
+
+pub fn clz64(v: u64) -> u32 {
+    if v == 0 {
+        return 64;
+    }
+    let mut n = 0u32;
+    let mut x = v;
+    if x & 0xFFFFFFFF00000000 == 0 {
+        n += 32;
+        x <<= 32;
+    }
+    if x & 0xFFFF000000000000 == 0 {
+        n += 16;
+        x <<= 16;
+    }
+    if x & 0xFF00000000000000 == 0 {
+        n += 8;
+        x <<= 8;
+    }
+    if x & 0xF000000000000000 == 0 {
+        n += 4;
+        x <<= 4;
+    }
+    if x & 0xC000000000000000 == 0 {
+        n += 2;
+        x <<= 2;
+    }
+    if x & 0x8000000000000000 == 0 {
+        n += 1;
+    }
+    n
+}
+
+pub fn ffs64(v: u64) -> Option<u32> {
+    if v == 0 {
+        return None;
+    }
+    Some(63 - clz64(v & v.wrapping_neg()))
+}
+
+pub fn align_up(addr: usize, align: usize) -> usize {
+    if align == 0 || (align & (align - 1)) != 0 {
+        return addr;
+    }
+    match addr.checked_add(align - 1) {
+        Some(v) => v & !(align - 1),
+        None => addr,
+    }
+}
+
+pub fn align_down(addr: usize, align: usize) -> usize {
+    if align == 0 || (align & (align - 1)) != 0 {
+        return addr;
+    }
+    addr & !(align - 1)
+}
+
+pub fn is_power_of_two(v: usize) -> bool {
+    v != 0 && (v & (v - 1)) == 0
+}
+
+pub fn log2_floor(v: usize) -> usize {
+    if v == 0 {
+        return 0;
+    }
+    (std::mem::size_of::<usize>() * 8) - 1 - (v.leading_zeros() as usize)
+}
+
+pub fn hash_combine(seed: u64, value: u64) -> u64 {
+    seed ^ (value
+        .wrapping_mul(0x9e3779b97f4a7c15)
+        .wrapping_add(seed << 6)
+        .wrapping_add(seed >> 2))
+}
+
+pub fn murmurhash3_finalize(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+    h
+}
+
+/// Simulated buddy allocator for page-sized physical memory blocks.
+///
+/// Each free list stores block base addresses for one order, where order `n`
+/// means a block of `2^n` pages. This allocator tracks metadata only; it does
+/// not own backing memory or enforce page-table mappings.
+pub struct BuddyAllocator {
+    pub free_lists: Vec<Vec<usize>>,
+    pub max_order: usize,
+    pub base_addr: usize,
+    pub total_pages: usize,
+    pub allocated: AtomicUsize,
+}
+
+impl BuddyAllocator {
+    /// Creates a new buddy allocator. It always creates free blocks of the largest possible order.
+    pub fn new(base: usize, total_pages: usize, max_order: usize) -> Self {
+        let mut free_lists = Vec::with_capacity(max_order + 1);
+        for _ in 0..=max_order {
+            free_lists.push(Vec::new());
+        }
+        let order = log2_floor(total_pages);
+        let usable_order = min(order, max_order);
+        let block_pages = 1 << usable_order;
+        let mut addr = base;
+        let mut remaining = total_pages;
+        while remaining >= block_pages {
+            free_lists[usable_order].push(addr);
+            addr += block_pages * PAGE_SZ;
+            remaining -= block_pages;
+        }
+        for split_order in (0..usable_order).rev() {
+            let pages = 1 << split_order;
+            while remaining >= pages {
+                free_lists[split_order].push(addr);
+                addr += pages * PAGE_SZ;
+                remaining -= pages;
+            }
+        }
+        Self {
+            free_lists,
+            max_order,
+            base_addr: base,
+            total_pages,
+            allocated: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn alloc_order(&mut self, order: usize) -> Option<usize> {
+        if order > self.max_order {
+            return None;
+        }
+        for source_order in order..=self.max_order {
+            if let Some(block) = self.free_lists[source_order].pop() {
+                let mut current_order = source_order;
+                let addr = block;
+                while current_order > order {
+                    current_order -= 1;
+                    let buddy = addr + (1 << current_order) * PAGE_SZ;
+                    self.free_lists[current_order].push(buddy);
+                }
+                self.allocated.fetch_add(1 << order, Ordering::Relaxed);
+                return Some(addr);
+            }
+        }
+        None
+    }
+
+    // Note: this actually means if [addr,addr+2^order*PAGE_SZ) is in a free block.
+    fn range_is_free(&self, addr: usize, order: usize) -> bool {
+        let pages = 1usize << order;
+        let size = pages.saturating_mul(PAGE_SZ);
+        // Debug fix: when overflow occurs, we cannot consider it free.
+        let Some(end) = addr.checked_add(size) else {
+            return false;
+        };
+        for (free_order, list) in self.free_lists.iter().enumerate() {
+            let free_size = (1usize << free_order).saturating_mul(PAGE_SZ);
+            for &block in list {
+                let Some(block_end) = block.checked_add(free_size) else {
+                    continue;
+                };
+                if addr >= block && end <= block_end {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    // the addr of a block's buddy can be computed by flipping the bit corresponding to the block size in the block's address.
+    // this is the core of this function. but the detail is strange.
+    pub fn free_order(&mut self, addr: usize, order: usize) {
+        if order > self.max_order {
+            return;
+        }
+        if self.range_is_free(addr, order) {
+            return;
+        }
+        let mut current_addr = addr;
+        let mut current_order = order;
+        while current_order < self.max_order {
+            let block_size = (1 << current_order) * PAGE_SZ;
+            let Some(relative) = current_addr.checked_sub(self.base_addr) else {
+                break;
+            };
+            let Some(buddy_addr) = self.base_addr.checked_add(relative ^ block_size) else {
+                break;
+            };
+            if let Some(buddy_index) = self.free_lists[current_order]
+                .iter()
+                .position(|&candidate_addr| candidate_addr == buddy_addr)
+            {
+                self.free_lists[current_order].remove(buddy_index);
+                current_addr = min(current_addr, buddy_addr);
+                current_order += 1;
+            } else {
+                break;
+            }
+        }
+        self.free_lists[current_order].push(current_addr);
+        let pages = 1usize << order;
+        let current_allocated_pages = self.allocated.load(Ordering::Relaxed);
+        self.allocated.store(
+            current_allocated_pages.saturating_sub(pages),
+            Ordering::Relaxed,
+        );
+    }
+
+
+    pub fn free_pages_count(&self) -> usize {
+        let mut count = 0;
+        for (order, list) in self.free_lists.iter().enumerate() {
+            count += list.len() * (1 << order);
+        }
+        count
+    }
+
+    // There's a bug that it cannot distinguish free order 0 and no free pages.
+    pub fn largest_free_order(&self) -> usize {
+        for candidate_order in (0..=self.max_order).rev() {
+            if !self.free_lists[candidate_order].is_empty() {
+                return candidate_order;
+            }
+        }
+        0
+    }
+
+    pub fn fragmentation_score(&self) -> usize {
+        let total_free = self.free_pages_count();
+        if total_free == 0 {
+            return 0;
+        }
+        let largest = self.largest_free_order();
+        let largest_block = 1 << largest;
+        if total_free <= largest_block {
+            return 0;
+        }
+        ((total_free - largest_block) * 100) / total_free
+    }
+
+    pub fn snapshot(&self) -> BuddyAllocator {
+        BuddyAllocator {
+            free_lists: self.free_lists.clone(),
+            max_order: self.max_order,
+            base_addr: self.base_addr,
+            total_pages: self.total_pages,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
         }
     }
 }
