@@ -7213,6 +7213,8 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
 ///
 /// It groups the virtual memory map with minimal page-table metadata and the
 /// copy-on-write page records used by fork/page-fault simulation.
+///
+/// Note: the 'cow_pages' seems to map all pages instead of only the copy-on-write pages, this makes this struct a bit confusing.
 pub struct AddrSpace {
     pub vm_map: VmMap,
     pub page_table_root: usize,
@@ -7232,29 +7234,34 @@ impl AddrSpace {
         }
     }
 
+    // Refactor: use vm_map's methods.
+    // Note: 'cow_pages' maybe should be shared between parent and child, so it should be a Arc<Mutex<>>, but we do not change it for now.
     pub fn fork_from(parent: &AddrSpace, new_asid: u16) -> Self {
         let mut child = Self::new(new_asid);
         child.vm_map.brk = parent.vm_map.brk;
         child.vm_map.mmap_base = parent.vm_map.mmap_base;
-        for region in parent.vm_map.regions.iter() {
-            let new_region = VmRegion::new(region.base, region.len, region.flags);
-            new_region.ref_count.store(1, Ordering::Relaxed);
-            if region.flags & VM_WRITE != 0 {
-                region.ref_up();
+        for source_region in parent.vm_map.regions.iter() {
+            if source_region.flags & VM_WRITE != 0 {
+                source_region.ref_up();
             }
-            let _ = child.vm_map.insert(new_region);
+        }
+        for cloned_region in parent.vm_map.clone_regions() {
+            let _ = child.vm_map.insert(cloned_region);
         }
         {
             let parent_cow = parent.cow_pages.lock().unwrap();
             let mut child_cow = child.cow_pages.lock().unwrap();
             for (&addr, frame) in parent_cow.iter() {
                 frame.up();
+                // here we can only copy a new PgFrame with the same count.
                 child_cow.insert(addr, PgFrame::with_rc(frame.count()));
             }
         }
         child
     }
 
+    // Note: the correct behavior of this function is to detect whether the page is shared then assign a new frame to the page.
+    // Note: currently the system is not uniform on address space management.
     pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
         let page_addr = addr & !(PAGE_SZ - 1);
         let region = self.vm_map.find(addr).ok_or("segfault")?;
@@ -7279,6 +7286,8 @@ impl AddrSpace {
         }
     }
 
+    // remove the mapping of the specified range and free the associated PgFrame.
+    // Note: we do not understand why it only removes from cow_pages.
     pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
         let Some(end) = start.checked_add(len) else {
             return 0;
@@ -7298,6 +7307,7 @@ impl AddrSpace {
         removed + pages_to_remove.len()
     }
 
+    // currently this function changes flags of overlapping regions.
     pub fn protect(
         &mut self,
         start: usize,
@@ -7339,5 +7349,79 @@ impl AddrSpace {
         self.vm_map.regions[idx] = left;
         self.vm_map.regions.insert(idx + 1, right);
         Ok(())
+    }
+}
+
+/// Simulated Unix process group.
+/// 
+/// Note: its confusing that this struct is standalone and not the part of the Task struct, the only way of accessing is through 'broadcast_signal'.
+/// 
+/// Session is a collection of process groups.
+pub struct ProcessGroup {
+    pub pgid: Pgid,
+    pub leader: usize,
+    pub members: Mutex<Vec<usize>>,
+    pub session_id: usize,
+    pub foreground: AtomicBool, // is current process at foregroound of terminal.
+}
+
+impl ProcessGroup {
+    pub fn new(pgid: Pgid, leader: usize, session: usize) -> Self {
+        Self {
+            pgid,
+            leader,
+            members: Mutex::new(vec![leader]),
+            session_id: session,
+            foreground: AtomicBool::new(false),
+        }
+    }
+
+    pub fn add_member(&self, pid: usize) {
+        let mut members = self.members.lock().unwrap();
+        if !members.contains(&pid) {
+            members.push(pid);
+        }
+    }
+
+    pub fn remove_member(&self, pid: usize) -> bool {
+        let mut members = self.members.lock().unwrap();
+        let before = members.len();
+        members.retain(|&m| m != pid);
+        members.len() < before
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.lock().unwrap().is_empty()
+    }
+
+    pub fn member_count(&self) -> usize {
+        self.members.lock().unwrap().len()
+    }
+
+    pub fn is_leader(&self, pid: usize) -> bool {
+        self.leader == pid
+    }
+
+    pub fn set_foreground(&self, fg: bool) {
+        self.foreground.store(fg, Ordering::Relaxed);
+    }
+
+    pub fn is_foreground(&self) -> bool {
+        self.foreground.load(Ordering::Relaxed)
+    }
+
+    pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
+        let members = self.members.lock().unwrap();
+        let member_ids = members.clone();
+        drop(members);
+        for pid in member_ids {
+            let task = tasks.find(pid);
+            match task {
+                Some(t) => {
+                    t.send_sig(signo, self.leader as isize);
+                }
+                None => {}
+            }
+        }
     }
 }
