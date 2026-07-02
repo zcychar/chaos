@@ -137,6 +137,9 @@ impl CircBuf {
 /// `wq` tracks blocked receivers, and `shut` marks EOF/closed state.
 ///
 /// Note: simplify a lot of useless inlines.
+/// 
+/// 'guard' keeps the syncqueue and the buffer in a consistent state.
+/// use syncqueue here to store the blocked threads and correctly wake them up.
 pub struct Channel {
     pub buf: Mutex<CircBuf>,
     pub guard: Spin,
@@ -157,6 +160,7 @@ impl Channel {
         }
     }
 
+    // Debug fix: release the guard before sleeping to avoid deadlocks.
     pub fn recv(&self) -> Option<u8> {
         loop {
             self.guard.acquire();
