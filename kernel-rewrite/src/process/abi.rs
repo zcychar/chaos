@@ -2,6 +2,11 @@
 
 use std::collections::BTreeMap;
 
+/// Initial process stack layout inputs. It describes the init data for a new process to put on its stack when starting execution.
+/// Its only function here is to compute the total size of the stack.
+///
+/// `args`, `envs`, and `auxv` are used to compute where argv/envp/auxv data
+/// would be placed below a supplied stack top.
 pub struct ProcInit {
     pub args: Vec<String>,
     pub envs: Vec<String>,

@@ -229,18 +229,18 @@ impl Kernel {
                 let _map_fixed = (flags & 0x10) != 0;
                 let _map_private = (flags & 0x01) != 0;
                 let _map_shared = (flags & 0x02) != 0;
-                let mut vm_flags: u32 = 0;
+                let mut _vm_flags: u32 = 0;
                 if prot & 0x1 != 0 {
-                    vm_flags |= VM_READ;
+                    _vm_flags |= VM_READ;
                 }
                 if prot & 0x2 != 0 {
-                    vm_flags |= VM_WRITE;
+                    _vm_flags |= VM_WRITE;
                 }
                 if prot & 0x4 != 0 {
-                    vm_flags |= VM_EXEC;
+                    _vm_flags |= VM_EXEC;
                 }
                 if _map_shared {
-                    vm_flags |= VM_SHARED;
+                    _vm_flags |= VM_SHARED;
                 }
                 let result_addr = if addr != 0 && _map_fixed {
                     addr

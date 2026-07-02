@@ -6,7 +6,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
-
+// Tracks permitted, effective, and ambient capability bitsets.
+///
+/// `bits` is the permitted capability set, `effective` is the set checked for
+/// active permission decisions, and `ambient` records capabilities that may be
+/// carried across inheritance paths when they remain permitted.
 pub struct CapSet {
     pub bits: u64,
     pub effective: u64,

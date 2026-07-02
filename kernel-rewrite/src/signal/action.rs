@@ -2,6 +2,10 @@
 
 use crate::consts::*;
 
+/// Describes how one signal should be handled.
+///
+/// Signal-number validity is enforced by `SigSet::set_action`; this struct only
+/// stores the handler payload, action flags, and handler-time signal mask.
 pub struct SigAction {
     pub handler: usize,
     pub flags: u32,

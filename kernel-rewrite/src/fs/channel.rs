@@ -6,6 +6,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
 
+/// Fixed-size circular byte buffer used by channel and terminal-style queues.
+///
+/// `read_cursor` and `write_cursor` are cursor counters, `capacity` is the ring capacity, and `len` is the
+/// number of bytes currently stored. Push and pop wrap cursor counters back into
+/// the backing vector with modulo arithmetic.
+/// Note: the Buffer writes to index 1 instead of index 0 at first time. We do not change this behavior now.
 pub struct CircBuf {
     pub data: Vec<u8>,
     pub read_cursor: usize,
@@ -137,7 +143,7 @@ impl CircBuf {
 /// `wq` tracks blocked receivers, and `shut` marks EOF/closed state.
 ///
 /// Note: simplify a lot of useless inlines.
-/// 
+///
 /// 'guard' keeps the syncqueue and the buffer in a consistent state.
 /// use syncqueue here to store the blocked threads and correctly wake them up.
 pub struct Channel {

@@ -7,8 +7,11 @@ use std::cmp::min;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// Tracks permitted, effective, and ambient capability bitsets.
+/// Describes one physical-memory allocation zone.
 ///
+/// Zones group page frames by PFN range and track free-page watermarks. The
+/// frame allocator uses these watermarks to decide whether the zone can satisfy
+/// another allocation and how much reclaim pressure exists.
 pub struct ZoneInfo {
     pub zone_id: usize,
     pub base_pfn: usize,
@@ -145,6 +148,12 @@ impl PgFrame {
     }
 }
 
+/// Bitmap-style physical frame pool.
+///
+/// Each slot represents one physical frame: `true` means free and `false` means
+/// allocated.
+///
+/// Note(IMPORTANT): FramePool should store PgFrame instead of just a bitmap, but this requires too much refactoring, so we just keep it for now.
 pub struct FramePool {
     slots: Mutex<Vec<bool>>,
     pub(crate) capacity: usize,
@@ -270,6 +279,7 @@ impl FramePool {
 }
 
 /// Allocates one physical frame and returns its simulated physical address.
+/// we cannot use  FramePool::get() directly because this requires scanning based on the current clock tick.
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     let frame_index = {
         let mut slots = pool.slots.lock().unwrap();

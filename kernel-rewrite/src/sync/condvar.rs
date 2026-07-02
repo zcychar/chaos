@@ -7,9 +7,10 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-/// One slab allocator chunk for fixed-size objects.
+/// Records one epoll-style registration in the shared synchronization queue.
 ///
-/// `data` stores all object bytes, `obj_size` is the aligned size of each slot,
+/// `task_id` identifies the waiting task, `epfd` is that task's epoll file
+/// descriptor, and `fd` is the watched file descriptor that may become ready.
 pub struct RegEp {
     pub task_id: usize,
     pub epfd: usize,

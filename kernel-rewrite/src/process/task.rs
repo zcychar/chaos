@@ -602,10 +602,11 @@ pub fn yield_now_sync() {
     thread::yield_now();
 }
 
-/// Top-level simulation kernel facade.
+/// Simulated Unix process group.
 ///
-/// It owns the task table, block/cache devices, frame allocator, per-CPU current
-/// task slots, mount table, IPC stores, and the simulated TTY input buffer.
+/// Note: its confusing that this struct is standalone and not the part of the Task struct, the only way of accessing is through 'broadcast_signal'.
+///
+/// Session is a collection of process groups.
 pub struct ProcessGroup {
     pub pgid: Pgid,
     pub leader: usize,

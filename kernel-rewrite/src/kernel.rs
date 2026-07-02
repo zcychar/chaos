@@ -12,6 +12,10 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::thread;
 
+/// Top-level simulation kernel facade.
+///
+/// It owns the task table, block/cache devices, frame allocator, per-CPU current
+/// task slots, mount table, IPC stores, and the simulated TTY input buffer.
 pub struct Kernel {
     /// Global task/process table.
     pub tasks: TaskTable,

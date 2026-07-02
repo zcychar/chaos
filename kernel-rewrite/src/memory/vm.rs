@@ -7,6 +7,11 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+/// Describes one virtual-memory area and its mapping metadata.
+///
+/// The region is a half-open address range: `[base, base + len)`.
+/// `flags` stores VM_* permission and behavior bits, while `offset` points to
+/// the start of the backing file data for file-backed mappings.
 pub struct VmRegion {
     pub base: usize,
     pub len: usize,
@@ -373,10 +378,12 @@ pub fn compute_rss_watermark(regions: &[VmRegion], pool_capacity: usize) -> usiz
     min(raw_watermark, capacity / 2) as usize
 }
 
-/// Per-file-descriptor access options.
+/// Simulated process address space.
 ///
-/// `rd` and `wr` control read/write permission, `ap` means append mode, and
-/// `nb` means nonblocking mode.
+/// It groups the virtual memory map with minimal page-table metadata and the
+/// copy-on-write page records used by fork/page-fault simulation.
+///
+/// Note: the 'cow_pages' seems to map all pages instead of only the copy-on-write pages, this makes this struct a bit confusing.
 pub struct AddrSpace {
     pub vm_map: VmMap,
     pub page_table_root: usize,

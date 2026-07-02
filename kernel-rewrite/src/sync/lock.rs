@@ -2,6 +2,11 @@
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// A simple recursive global kernel lock used by the simulation kernel.
+///
+/// `holder` records the logical owner id, and `depth` tracks recursive entries
+/// by that same owner. The lock is fully released only when the depth reaches
+/// zero.
 pub struct KernLock {
     flag: AtomicBool,
     holder: AtomicUsize,
@@ -81,9 +86,10 @@ unsafe impl Sync for KernLock {}
 
 pub static GKL: KernLock = KernLock::new();
 
-/// Describes one physical-memory allocation zone.
+/// Minimal spin lock used by small simulated kernel objects.
 ///
-/// Zones group page frames by PFN range and track free-page watermarks. The
+/// The lock is a single atomic flag. `acquire` spins until it flips the flag
+/// from unlocked to locked, while `release` stores the flag back to unlocked.
 pub struct Spin {
     locked: AtomicBool,
 }

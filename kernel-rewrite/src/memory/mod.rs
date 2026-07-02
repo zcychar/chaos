@@ -15,11 +15,11 @@ use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// Fixed-size circular byte buffer used by channel and terminal-style queues.
+/// One slab allocator chunk for fixed-size objects.
 ///
-/// `read_cursor` and `write_cursor` are cursor counters, `capacity` is the ring capacity, and `len` is the
-/// number of bytes currently stored. Push and pop wrap cursor counters back into
-/// the backing vector with modulo arithmetic.
+/// `data` stores all object bytes, `obj_size` is the aligned size of each slot,
+/// `free_list` stores free slot offsets inside `data`, and `allocated` tracks
+/// how many slots are currently checked out.
 pub struct SlabEntry {
     pub data: Vec<u8>,
     pub obj_size: usize,
@@ -367,10 +367,11 @@ pub fn compute_load_balance(
     best_cpu
 }
 
-/// Simulated Unix process group.
+/// Simulated buddy allocator for page-sized physical memory blocks.
 ///
-/// Note: its confusing that this struct is standalone and not the part of the Task struct, the only way of accessing is through 'broadcast_signal'.
-///
+/// Each free list stores block base addresses for one order, where order `n`
+/// means a block of `2^n` pages. This allocator tracks metadata only; it does
+/// not own backing memory or enforce page-table mappings.
 pub struct BuddyAllocator {
     pub free_lists: Vec<Vec<usize>>,
     pub max_order: usize,
